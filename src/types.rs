@@ -1,18 +1,7 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisteredGroup {
-    pub name: String,
-    pub folder: String,
-    pub trigger: String,
-    pub added_at: String,
-    #[serde(default = "default_requires_trigger")]
-    pub requires_trigger: Option<bool>,
-}
-
-fn default_requires_trigger() -> Option<bool> {
-    None
-}
+use crate::comm::ChannelAddr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewMessage {
@@ -22,6 +11,18 @@ pub struct NewMessage {
     pub sender_name: String,
     pub content: String,
     pub timestamp: String,
+    #[serde(default)]
+    pub module_id: Option<String>,
+}
+
+impl NewMessage {
+    /// Get the ChannelAddr for this message.
+    pub fn addr(&self) -> ChannelAddr {
+        ChannelAddr::new(
+            self.module_id.as_deref().unwrap_or("whatsapp"),
+            &self.chat_jid,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +39,18 @@ pub struct ScheduledTask {
     pub last_result: Option<String>,
     pub status: TaskStatus,
     pub created_at: String,
+    #[serde(default = "default_module_id")]
+    pub module_id: String,
+}
+
+fn default_module_id() -> String {
+    "whatsapp".into()
+}
+
+impl ScheduledTask {
+    pub fn addr(&self) -> ChannelAddr {
+        ChannelAddr::new(&self.module_id, &self.chat_jid)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -162,15 +175,20 @@ pub struct AvailableGroup {
 #[derive(Debug)]
 pub enum IpcCommand {
     SendMessage {
-        chat_jid: String,
+        addr: ChannelAddr,
         text: String,
+    },
+    CallModuleTool {
+        module_id: String,
+        tool_name: String,
+        input: Value,
     },
     ScheduleTask {
         prompt: String,
         schedule_type: String,
         schedule_value: String,
         context_mode: String,
-        target_jid: String,
+        target_addr: ChannelAddr,
         source_group: String,
     },
     PauseTask {
@@ -185,11 +203,4 @@ pub enum IpcCommand {
         task_id: String,
         source_group: String,
     },
-    RegisterGroup {
-        jid: String,
-        name: String,
-        folder: String,
-        trigger: String,
-    },
-    RefreshGroups,
 }

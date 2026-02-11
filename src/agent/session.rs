@@ -13,23 +13,32 @@ pub struct Session {
     pub id: String,
     pub messages: Vec<Message>,
     session_dir: PathBuf,
+    persist: bool,
 }
 
 impl Session {
-    pub fn load_or_create(workspace_dir: &Path, session_id: Option<&str>) -> Self {
+    pub fn load_or_create(workspace_dir: &Path, session_id: Option<&str>, persist: bool) -> Self {
         let session_dir = workspace_dir.join(SESSIONS_DIR);
-        let _ = std::fs::create_dir_all(&session_dir);
+        if persist {
+            let _ = std::fs::create_dir_all(&session_dir);
+        }
 
-        if let Some(sid) = session_id {
-            let session_file = session_dir.join(format!("{}.jsonl", sid));
-            if session_file.exists() {
-                match Self::load_from_file(&session_file, sid) {
-                    Ok(session) => {
-                        info!(session_id = sid, messages = session.messages.len(), "Resumed session");
-                        return session;
-                    }
-                    Err(e) => {
-                        error!("Failed to load session {}: {}", sid, e);
+        if persist {
+            if let Some(sid) = session_id {
+                let session_file = session_dir.join(format!("{}.jsonl", sid));
+                if session_file.exists() {
+                    match Self::load_from_file(&session_file, sid) {
+                        Ok(session) => {
+                            info!(
+                                session_id = sid,
+                                messages = session.messages.len(),
+                                "Resumed session"
+                            );
+                            return session;
+                        }
+                        Err(e) => {
+                            error!("Failed to load session {}: {}", sid, e);
+                        }
                     }
                 }
             }
@@ -41,6 +50,7 @@ impl Session {
             id,
             messages: Vec::new(),
             session_dir,
+            persist,
         }
     }
 
@@ -61,10 +71,14 @@ impl Session {
             id: session_id.to_string(),
             messages,
             session_dir: path.parent().unwrap_or(Path::new(".")).to_path_buf(),
+            persist: true,
         })
     }
 
     pub fn save(&self, workspace_dir: &Path) -> crate::error::Result<()> {
+        if !self.persist {
+            return Ok(());
+        }
         let session_dir = workspace_dir.join(SESSIONS_DIR);
         std::fs::create_dir_all(&session_dir)?;
 
@@ -88,15 +102,22 @@ impl Session {
 
     pub fn estimated_tokens(&self) -> usize {
         // Rough estimate: ~4 chars per token
-        let total_chars: usize = self.messages.iter().map(|m| {
-            m.content.iter().map(|c| match c {
-                super::api::ContentBlock::Text { text } => text.len(),
-                super::api::ContentBlock::ToolUse { input, .. } => {
-                    serde_json::to_string(input).map_or(0, |s| s.len())
-                }
-                super::api::ContentBlock::ToolResult { content, .. } => content.len(),
-            }).sum::<usize>()
-        }).sum();
+        let total_chars: usize = self
+            .messages
+            .iter()
+            .map(|m| {
+                m.content
+                    .iter()
+                    .map(|c| match c {
+                        super::api::ContentBlock::Text { text } => text.len(),
+                        super::api::ContentBlock::ToolUse { input, .. } => {
+                            serde_json::to_string(input).map_or(0, |s| s.len())
+                        }
+                        super::api::ContentBlock::ToolResult { content, .. } => content.len(),
+                    })
+                    .sum::<usize>()
+            })
+            .sum();
         total_chars / 4
     }
 }

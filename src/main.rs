@@ -1,31 +1,38 @@
 #![allow(dead_code)]
 
 mod agent;
-mod bridge;
+mod comm;
 mod config;
 mod dashboard;
 mod db;
+mod dispatch;
 mod error;
 mod module;
+mod modules;
+mod prompt;
 mod queue;
+mod registry;
 mod scheduler;
 mod types;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
-use bridge::protocol::BridgeEvent;
+use comm::{
+    ChannelAddr, CommunicationModule, MiraMessage, ModuleCommand, ModuleEvent, ModuleToolDefinition,
+};
 use config::Config;
-use dashboard::state::{GroupDisplay, GroupDisplayStatus};
 use dashboard::{Dashboard, DashboardCommand};
 use db::Database;
 use module::{Module, ModuleStatus};
-use queue::GroupQueue;
+use prompt::xml_escape;
+use queue::ModuleQueue;
+use registry::{ModuleInit, ModuleRegistration};
 use scheduler::Scheduler;
-use types::{IpcCommand, RegisteredGroup};
+use types::IpcCommand;
 
 #[tokio::main]
 async fn main() {
@@ -44,9 +51,7 @@ async fn main() {
             .with_writer(std::sync::Mutex::new(log_file))
             .init();
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .init();
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
     }
 
     info!("Mira starting...");
@@ -62,27 +67,16 @@ async fn main() {
     info!("Database initialized");
 
     // Load state
-    let mut registered_groups = db.get_all_registered_groups().unwrap_or_default();
-    let mut sessions = db.get_all_sessions().unwrap_or_default();
-    let mut last_timestamp = db
-        .get_router_state("last_timestamp")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let _last_agent_timestamp: HashMap<String, String> = db
-        .get_router_state("last_agent_timestamp")
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-
-    info!(
-        group_count = registered_groups.len(),
-        "State loaded"
-    );
+    info!("State loaded");
 
     // Shutdown coordination
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let shutdown_tx_signal = shutdown_tx.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            let _ = shutdown_tx_signal.send(true);
+        }
+    });
 
     // IPC channel: agent tools -> main loop
     let (ipc_tx, mut ipc_rx) = mpsc::channel::<IpcCommand>(100);
@@ -91,11 +85,11 @@ async fn main() {
     let (dash_tx, dash_rx) = mpsc::channel::<DashboardCommand>(200);
     let (input_tx, mut input_rx) = mpsc::channel::<String>(10);
 
-    // Bridge events channel
-    let (bridge_event_tx, mut bridge_event_rx) = mpsc::channel::<BridgeEvent>(100);
+    // Unified module event channel
+    let (module_event_tx, mut module_event_rx) = mpsc::channel::<ModuleEvent>(200);
 
-    // GroupQueue
-    let group_queue = Arc::new(GroupQueue::new(config.max_concurrent_agents));
+    // ModuleQueue
+    let module_queue = Arc::new(ModuleQueue::new(config.max_concurrent_agents));
 
     // Start dashboard (if enabled)
     let _dashboard_handle = if config.dashboard_enabled {
@@ -104,12 +98,13 @@ async fn main() {
             config.max_concurrent_agents,
             config.api_base_url.clone(),
             config.claude_model.clone(),
+            config.dashboard_max_lines,
             dash_rx,
             shutdown_rx.clone(),
             Some(input_tx.clone()),
         );
-        Some(tokio::spawn(async move {
-            if let Err(e) = dashboard.run().await {
+        Some(std::thread::spawn(move || {
+            if let Err(e) = dashboard.run() {
                 error!("Dashboard error: {}", e);
             }
         }))
@@ -122,59 +117,367 @@ async fn main() {
         None
     };
 
-    // Send initial groups to dashboard
-    {
-        let groups: HashMap<String, GroupDisplay> = registered_groups
-            .iter()
-            .map(|(jid, g)| {
-                (
-                    jid.clone(),
-                    GroupDisplay {
-                        name: g.name.clone(),
-                        folder: g.folder.clone(),
-                        status: GroupDisplayStatus::Idle,
-                    },
-                )
-            })
-            .collect();
-        let _ = dash_tx.send(DashboardCommand::SetGroups(groups)).await;
-        let _ = dash_tx.send(DashboardCommand::EnableInputMode).await;
+    // Enable input by default
+    let _ = dash_tx.send(DashboardCommand::EnableInputMode).await;
 
-        // Initialize modules
-        let mut whatsapp = Module::new("whatsapp", "WhatsApp");
-        whatsapp.mounted = true;
-        whatsapp.status = ModuleStatus::Connecting;
-        let _ = dash_tx.send(DashboardCommand::SetModules(vec![whatsapp])).await;
-    }
+    // --- Module registry ---
+    let modules: Arc<tokio::sync::Mutex<HashMap<String, Box<dyn CommunicationModule>>>> =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
-    // Start bridge manager
-    let bridge_dir = std::env::current_dir()
-        .unwrap_or_default()
-        .join("bridge");
-    let store_dir = config.store_dir.clone();
-    let bridge_event_tx_clone = bridge_event_tx.clone();
-    let bridge_shutdown_rx = shutdown_rx.clone();
+    // Start modules from registry
+    let base_dir = std::env::current_dir().unwrap_or_default();
+    let mut init = ModuleInit {
+        config: config.clone(),
+        db: db.clone(),
+        dash_tx: dash_tx.clone(),
+        base_dir,
+    };
 
-    let bridge_handle = tokio::spawn(async move {
-        let mut manager =
-            bridge::BridgeManager::new(bridge_dir, store_dir, bridge_event_tx_clone);
-        tokio::select! {
-            result = manager.run() => {
-                if let Err(e) = result {
-                    error!("Bridge manager error: {}", e);
-                }
+    let mut module_displays = Vec::new();
+    for reg in inventory::iter::<ModuleRegistration> {
+        let mut display = Module::new(reg.id, reg.display_name);
+        display.mounted = true;
+
+        let readiness = (reg.ready)(&init);
+        if !readiness.ready {
+            display.status = ModuleStatus::Disconnected;
+            module_displays.push(display);
+            warn!(
+                module_id = reg.id,
+                reason = readiness.reason.as_deref().unwrap_or("not ready"),
+                "Module skipped"
+            );
+            continue;
+        }
+
+        display.status = reg.initial_status.clone();
+        module_displays.push(display);
+
+        let mut module = (reg.build)(&mut init);
+        match module.start().await {
+            Ok(event_rx) => {
+                let tx = module_event_tx.clone();
+                tokio::spawn(async move {
+                    let mut rx = event_rx;
+                    while let Some(event) = rx.recv().await {
+                        if tx.send(event).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                info!(module_id = reg.id, "Module started");
             }
-            _ = async {
-                let mut rx = bridge_shutdown_rx;
-                loop {
-                    if rx.changed().await.is_err() { break; }
-                    if *rx.borrow() { break; }
-                }
-            } => {
-                manager.request_shutdown();
+            Err(e) => {
+                error!(module_id = reg.id, "Failed to start module: {}", e);
             }
         }
-    });
+
+        let mut modules_lock = modules.lock().await;
+        modules_lock.insert(reg.id.into(), module);
+    }
+
+    let _ = dash_tx
+        .send(DashboardCommand::SetModules(module_displays))
+        .await;
+
+    // Core terminal input queue (not a module)
+    let core_pending: Arc<tokio::sync::Mutex<VecDeque<MiraMessage>>> =
+        Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
+
+    {
+        let core_pending = core_pending.clone();
+        let dash_tx = dash_tx.clone();
+        let module_queue = module_queue.clone();
+        let config = config.clone();
+        tokio::spawn(async move {
+            while let Some(input) = input_rx.recv().await {
+                let _ = dash_tx
+                    .send(DashboardCommand::PushThinkingLine(format!(
+                        "[TERM] {}",
+                        input
+                    )))
+                    .await;
+                let _ = dash_tx.send(DashboardCommand::IncrementMessages(1)).await;
+                let timestamp = chrono::Utc::now().to_rfc3339();
+                let msg = MiraMessage {
+                    addr: ChannelAddr::new("terminal", "terminal"),
+                    msg_id: format!("term-{}", chrono::Utc::now().timestamp_millis()),
+                    sender_id: "owner".into(),
+                    sender_name: config.owner_name.clone(),
+                    content: input,
+                    timestamp,
+                    is_from_self: false,
+                    channel_name: Some("Terminal".into()),
+                };
+                {
+                    let mut pending = core_pending.lock().await;
+                    pending.push_back(msg);
+                }
+                module_queue.enqueue_module("core".into()).await;
+            }
+        });
+    }
+
+    // Wire up ModuleQueue process_fn — modules emit work items, Mira runs agents.
+    {
+        let process_db = db.clone();
+        let process_config = config.clone();
+        let process_ipc_tx = ipc_tx.clone();
+        let process_modules = modules.clone();
+        let process_dash_tx = dash_tx.clone();
+        let core_pending = core_pending.clone();
+
+        module_queue
+            .set_process_fn(Arc::new(move |module_id: String| {
+                let db = process_db.clone();
+                let config = process_config.clone();
+                let ipc_tx = process_ipc_tx.clone();
+                let modules = process_modules.clone();
+                let dash_tx = process_dash_tx.clone();
+                let core_pending = core_pending.clone();
+
+                Box::pin(async move {
+                    if module_id == "core" {
+                        let mut pending = core_pending.lock().await;
+                        if pending.is_empty() {
+                            return true;
+                        }
+
+                        let mut prompt = String::from("<messages>\n");
+                        while let Some(msg) = pending.pop_front() {
+                            prompt.push_str(&format!(
+                                "<message sender=\"{}\" channel=\"terminal\" time=\"{}\">{}</message>\n",
+                                xml_escape(&msg.sender_name),
+                                msg.timestamp,
+                                xml_escape(&msg.content),
+                            ));
+                        }
+                        prompt.push_str("</messages>");
+
+                        let tools_info = {
+                            let mut modules_lock = modules.lock().await;
+                            let mut tools_by_module = Vec::new();
+                            for (mid, module) in modules_lock.iter_mut() {
+                                tools_by_module.push((mid.clone(), module.tools()));
+                            }
+                            format_all_module_tools(tools_by_module)
+                        };
+                        let prompt = format!("{}\n{}", tools_info, prompt);
+
+                        let agent_input = agent::AgentInput {
+                            prompt,
+                            session_id: None,
+                            group_folder: "terminal".to_string(),
+                            addr: ChannelAddr::new("terminal", "terminal"),
+                            is_main: true,
+                            is_scheduled_task: false,
+                            persist_session: false,
+                            workspace_dir: config.store_dir.clone(),
+                            global_claude_md: None,
+                        };
+
+                        let dash_tx_clone = dash_tx.clone();
+                        let on_progress: Option<agent::OnProgressCallback> =
+                            Some(Box::new(move |event| match event.event_type {
+                                agent::ProgressEventType::TextStreaming => {
+                                    let _ = dash_tx_clone
+                                        .try_send(DashboardCommand::SetThinkingIndicator(None));
+                                    let _ = dash_tx_clone.try_send(
+                                        DashboardCommand::SetStreamingLine(Some(event.text)),
+                                    );
+                                }
+                                agent::ProgressEventType::Text => {
+                                    let _ = dash_tx_clone
+                                        .try_send(DashboardCommand::SetThinkingIndicator(None));
+                                    let _ = dash_tx_clone
+                                        .try_send(DashboardCommand::SetStreamingLine(None));
+                                    let _ = dash_tx_clone
+                                        .try_send(DashboardCommand::PushThinkingLine(event.text));
+                                }
+                                agent::ProgressEventType::ToolUse => {
+                                    let _ = dash_tx_clone
+                                        .try_send(DashboardCommand::SetStreamingLine(None));
+                                    let _ = dash_tx_clone.try_send(
+                                        DashboardCommand::SetThinkingIndicator(Some(event.text)),
+                                    );
+                                }
+                                agent::ProgressEventType::ToolSummary => {
+                                    let _ = dash_tx_clone
+                                        .try_send(DashboardCommand::PushThinkingLine(event.text));
+                                }
+                            }));
+
+                        let _ = dash_tx
+                            .send(DashboardCommand::SetThinkingIndicator(Some(
+                                "Thinking...".into(),
+                            )))
+                            .await;
+
+                        let output = agent::run_agent(
+                            agent_input,
+                            &config,
+                            db.clone(),
+                            ipc_tx.clone(),
+                            on_progress,
+                        )
+                        .await;
+
+                        let _ = dash_tx
+                            .send(DashboardCommand::SetThinkingIndicator(None))
+                            .await;
+
+                        if output.status == agent::AgentStatus::Error {
+                            error!(
+                                module_id = %module_id,
+                                error = ?output.error,
+                                "Agent failed for core input"
+                            );
+                            let _ = dash_tx
+                                .send(DashboardCommand::PushThinkingLine(format!(
+                                    "Error: {}",
+                                    output.error.unwrap_or_default()
+                                )))
+                                .await;
+                            return false;
+                        }
+
+                        return true;
+                    }
+
+                    let work_items = {
+                        let mut modules_lock = modules.lock().await;
+                        let Some(module) = modules_lock.get_mut(&module_id) else {
+                            warn!(module_id, "No module registered for dispatch");
+                            return false;
+                        };
+                        match module.drain_work_items().await {
+                            Ok(items) => items,
+                            Err(e) => {
+                                error!(module_id, "Failed to drain work items: {}", e);
+                                return false;
+                            }
+                        }
+                    };
+
+                    if work_items.is_empty() {
+                        return true;
+                    }
+
+                    for item in work_items {
+                        let (session_id, persist_session) = {
+                            let mut modules_lock = modules.lock().await;
+                            if let Some(module) = modules_lock.get_mut(&module_id) {
+                                let sid = module
+                                    .get_session_id(&item.group_folder)
+                                    .await
+                                    .ok()
+                                    .flatten();
+                                (sid, module.persist_sessions())
+                            } else {
+                                (None, true)
+                            }
+                        };
+
+                        let tools_info = {
+                            let mut modules_lock = modules.lock().await;
+                            let mut tools_by_module = Vec::new();
+                            for (mid, module) in modules_lock.iter_mut() {
+                                tools_by_module.push((mid.clone(), module.tools()));
+                            }
+                            format_all_module_tools(tools_by_module)
+                        };
+                        let prompt = format!("{}\n{}", tools_info, item.prompt);
+
+                        let agent_input = agent::AgentInput {
+                            prompt,
+                            session_id,
+                            group_folder: item.group_folder.clone(),
+                            addr: item.addr.clone(),
+                            is_main: item.is_main,
+                            is_scheduled_task: item.is_scheduled_task,
+                            persist_session,
+                            workspace_dir: item.workspace_dir,
+                            global_claude_md: item.global_claude_md,
+                        };
+
+                        let dash_tx_clone = dash_tx.clone();
+                        let on_progress: Option<agent::OnProgressCallback> =
+                            Some(Box::new(move |event| match event.event_type {
+                                agent::ProgressEventType::TextStreaming => {
+                                    let _ = dash_tx_clone
+                                        .try_send(DashboardCommand::SetThinkingIndicator(None));
+                                    let _ = dash_tx_clone.try_send(
+                                        DashboardCommand::SetStreamingLine(Some(event.text)),
+                                    );
+                                }
+                                agent::ProgressEventType::Text => {
+                                    let _ = dash_tx_clone
+                                        .try_send(DashboardCommand::SetThinkingIndicator(None));
+                                    let _ = dash_tx_clone
+                                        .try_send(DashboardCommand::SetStreamingLine(None));
+                                    let _ = dash_tx_clone
+                                        .try_send(DashboardCommand::PushThinkingLine(event.text));
+                                }
+                                agent::ProgressEventType::ToolUse => {
+                                    let _ = dash_tx_clone
+                                        .try_send(DashboardCommand::SetStreamingLine(None));
+                                    let _ = dash_tx_clone.try_send(
+                                        DashboardCommand::SetThinkingIndicator(Some(event.text)),
+                                    );
+                                }
+                                agent::ProgressEventType::ToolSummary => {
+                                    let _ = dash_tx_clone
+                                        .try_send(DashboardCommand::PushThinkingLine(event.text));
+                                }
+                            }));
+
+                        let _ = dash_tx
+                            .send(DashboardCommand::SetThinkingIndicator(Some(
+                                "Thinking...".into(),
+                            )))
+                            .await;
+
+                        let output = agent::run_agent(
+                            agent_input,
+                            &config,
+                            db.clone(),
+                            ipc_tx.clone(),
+                            on_progress,
+                        )
+                        .await;
+
+                        let _ = dash_tx
+                            .send(DashboardCommand::SetThinkingIndicator(None))
+                            .await;
+
+                        if let Some(sid) = output.new_session_id {
+                            let mut modules_lock = modules.lock().await;
+                            if let Some(module) = modules_lock.get_mut(&module_id) {
+                                let _ = module.set_session_id(&item.group_folder, &sid).await;
+                            }
+                        }
+
+                        if output.status == agent::AgentStatus::Error {
+                            error!(
+                                module_id = %module_id,
+                                error = ?output.error,
+                                "Agent failed for module"
+                            );
+                            let _ = dash_tx
+                                .send(DashboardCommand::PushThinkingLine(format!(
+                                    "Error: {}",
+                                    output.error.unwrap_or_default()
+                                )))
+                                .await;
+                            return false;
+                        }
+                    }
+
+                    true
+                })
+            }))
+            .await;
+    }
 
     // Start scheduler
     let scheduler_db = db.clone();
@@ -185,183 +488,47 @@ async fn main() {
         scheduler.run_loop(scheduler_shutdown_rx).await;
     });
 
-    // Graceful shutdown handler
-    let shutdown_tx_clone = shutdown_tx.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        info!("Shutdown signal received");
-        let _ = shutdown_tx_clone.send(true);
-    });
-
     // Main event loop
-    let mut message_poll_interval =
-        tokio::time::interval(tokio::time::Duration::from_millis(config.poll_interval_ms));
-
     loop {
         tokio::select! {
-            // Message polling
-            _ = message_poll_interval.tick() => {
-                if *shutdown_rx.borrow() {
-                    break;
-                }
-
-                let jids: Vec<String> = registered_groups.keys().cloned().collect();
-                match db.get_new_messages(&jids, &last_timestamp, &config.assistant_name) {
-                    Ok((messages, new_ts)) => {
-                        if !messages.is_empty() {
-                            let _ = dash_tx.send(DashboardCommand::IncrementMessages(messages.len())).await;
-                            info!(count = messages.len(), "New messages");
-
-                            last_timestamp = new_ts;
-                            let _ = db.set_router_state("last_timestamp", &last_timestamp);
-
-                            let mut groups_with_messages = HashSet::new();
-                            for msg in &messages {
-                                groups_with_messages.insert(msg.chat_jid.clone());
-                            }
-
-                            for chat_jid in groups_with_messages {
-                                group_queue.enqueue_message_check(chat_jid).await;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Error polling messages: {}", e);
-                    }
-                }
-            }
-
-            // Bridge events
-            Some(event) = bridge_event_rx.recv() => {
+            // Unified module events
+            Some(event) = module_event_rx.recv() => {
                 match event {
-                    BridgeEvent::Ready { user_jid, lid_jid } => {
-                        info!(?user_jid, ?lid_jid, "Bridge ready");
-                        let _ = dash_tx.send(DashboardCommand::SetModuleStatus("whatsapp".into(), ModuleStatus::Connected)).await;
-                    }
-                    BridgeEvent::Message { msg_id, chat_jid, sender, sender_name, content, timestamp, is_from_me, chat_name } => {
-                        let _ = db.store_chat_metadata(&chat_jid, &timestamp, chat_name.as_deref());
-                        if registered_groups.contains_key(&chat_jid) {
-                            let _ = db.store_message(&msg_id, &chat_jid, &sender, &sender_name, &content, &timestamp, is_from_me);
+                    ModuleEvent::Message(msg) => {
+                        if !msg.is_from_self {
+                            let _ = dash_tx
+                                .send(DashboardCommand::IncrementMessages(1))
+                                .await;
+                            module_queue
+                                .enqueue_module(msg.addr.module_id.clone())
+                                .await;
                         }
                     }
-                    BridgeEvent::ChatMetadata { chat_jid, timestamp, name } => {
-                        let _ = db.store_chat_metadata(&chat_jid, &timestamp, name.as_deref());
+                    ModuleEvent::StatusChange { module_id, status } => {
+                        let _ = dash_tx.send(DashboardCommand::SetModuleStatus(
+                            module_id, status
+                        )).await;
                     }
-                    BridgeEvent::Connection { status, reason } => {
-                        let module_status = match status.as_str() {
-                            "open" => ModuleStatus::Connected,
-                            "close" => {
-                                if reason.map_or(true, |r| r != 401 && r != 440) {
-                                    ModuleStatus::Reconnecting
-                                } else {
-                                    ModuleStatus::Disconnected
-                                }
-                            }
-                            _ => ModuleStatus::Connecting,
-                        };
-                        let _ = dash_tx.send(DashboardCommand::SetModuleStatus("whatsapp".into(), module_status)).await;
+                    ModuleEvent::Log { module_id, message } => {
+                        let _ = dash_tx
+                            .send(DashboardCommand::PushThinkingLine(format!(
+                                "[{}] {}",
+                                module_id, message
+                            )))
+                            .await;
                     }
-                    BridgeEvent::GroupsResult { groups } => {
-                        for g in groups {
-                            let _ = db.update_chat_name(&g.jid, &g.subject);
-                        }
-                        let _ = db.set_last_group_sync();
+                    ModuleEvent::Error { module_id, message } => {
+                        error!(module_id, message, "Module error");
                     }
-                    BridgeEvent::Error { message } => {
-                        error!("Bridge error: {}", message);
-                    }
-                    BridgeEvent::Qr { .. } => {
-                        error!("WhatsApp QR required - run setup first");
-                    }
-                    BridgeEvent::MessageSent { .. } => {}
                 }
             }
 
             // IPC commands from agent tools
             Some(cmd) = ipc_rx.recv() => {
-                handle_ipc_command(cmd, &config, &db, &mut registered_groups, &mut sessions, &dash_tx).await;
-            }
-
-            // Terminal input
-            Some(input) = input_rx.recv() => {
-                let _ = dash_tx.send(DashboardCommand::PushThinkingLine(
-                    format!("[TERM] {}", input)
-                )).await;
-
-                let (workspace_dir, group_folder, chat_jid, is_main) =
-                    if let Some((jid, group)) = registered_groups.iter().next() {
-                        (config.groups_dir.join(&group.folder), group.folder.clone(),
-                         jid.clone(), config.is_main_group(&group.folder))
-                    } else {
-                        let folder = "terminal".to_string();
-                        (config.groups_dir.join(&folder), folder, "terminal".to_string(), true)
-                    };
-
-                let timestamp = chrono::Utc::now().to_rfc3339();
-                let prompt = format!(
-                    "<messages>\n<message sender=\"{}\" channel=\"terminal\" time=\"{}\">{}</message>\n</messages>",
-                    xml_escape(&config.owner_name),
-                    timestamp,
-                    xml_escape(&input)
-                );
-
-                let agent_input = agent::AgentInput {
-                    prompt,
-                    session_id: sessions.get(&group_folder).cloned(),
-                    group_folder: group_folder.clone(),
-                    chat_jid,
-                    is_main,
-                    is_scheduled_task: false,
-                    workspace_dir,
-                    global_claude_md: None,
-                };
-
-                let dash_tx_clone = dash_tx.clone();
-                let on_progress: Option<agent::OnProgressCallback> = Some(Box::new(move |event| {
-                    match event.event_type {
-                        agent::ProgressEventType::TextStreaming => {
-                            let _ = dash_tx_clone.try_send(DashboardCommand::SetThinkingIndicator(None));
-                            let _ = dash_tx_clone.try_send(DashboardCommand::SetStreamingLine(Some(event.text)));
-                        }
-                        agent::ProgressEventType::Text => {
-                            let _ = dash_tx_clone.try_send(DashboardCommand::SetThinkingIndicator(None));
-                            let _ = dash_tx_clone.try_send(DashboardCommand::SetStreamingLine(None));
-                            let _ = dash_tx_clone.try_send(DashboardCommand::PushThinkingLine(event.text));
-                        }
-                        agent::ProgressEventType::ToolUse => {
-                            let _ = dash_tx_clone.try_send(DashboardCommand::SetStreamingLine(None));
-                            let _ = dash_tx_clone.try_send(DashboardCommand::SetThinkingIndicator(Some(event.text)));
-                        }
-                        agent::ProgressEventType::ToolSummary => {
-                            let _ = dash_tx_clone.try_send(DashboardCommand::PushThinkingLine(event.text));
-                        }
-                    }
-                }));
-
-                let _ = dash_tx.send(DashboardCommand::SetThinkingIndicator(
-                    Some("Thinking...".into())
-                )).await;
-
-                let output = agent::run_agent(
-                    agent_input,
-                    &config,
-                    db.clone(),
-                    ipc_tx.clone(),
-                    on_progress,
+                handle_ipc_command(
+                    cmd, &config, &db,
+                    &dash_tx, &modules,
                 ).await;
-
-                let _ = dash_tx.send(DashboardCommand::SetThinkingIndicator(None)).await;
-
-                if let Some(sid) = output.new_session_id {
-                    sessions.insert(group_folder.clone(), sid.clone());
-                    let _ = db.set_session(&group_folder, &sid);
-                }
-
-                if output.status == agent::AgentStatus::Error {
-                    let _ = dash_tx.send(DashboardCommand::PushThinkingLine(
-                        format!("Error: {}", output.error.unwrap_or_default())
-                    )).await;
-                }
             }
 
             // Shutdown
@@ -377,9 +544,16 @@ async fn main() {
         }
     }
 
+    // Graceful shutdown
     info!("Shutting down...");
-    group_queue.shutdown(10_000).await;
-    bridge_handle.abort();
+    module_queue.shutdown(10_000).await;
+    {
+        let mut modules_lock = modules.lock().await;
+        for (id, module) in modules_lock.iter_mut() {
+            info!(module_id = %id, "Shutting down module");
+            module.shutdown().await;
+        }
+    }
     scheduler_handle.abort();
     info!("Mira shutdown complete");
 }
@@ -388,39 +562,120 @@ async fn handle_ipc_command(
     cmd: IpcCommand,
     config: &Config,
     db: &Arc<Database>,
-    registered_groups: &mut HashMap<String, RegisteredGroup>,
-    _sessions: &mut HashMap<String, String>,
     dash_tx: &mpsc::Sender<DashboardCommand>,
+    modules: &Arc<tokio::sync::Mutex<HashMap<String, Box<dyn CommunicationModule>>>>,
 ) {
     match cmd {
-        IpcCommand::SendMessage { chat_jid, text: _ } => {
-            info!(chat_jid, "IPC: send_message");
-            // Bridge send will be implemented when bridge command forwarding is connected
+        IpcCommand::CallModuleTool {
+            module_id,
+            tool_name,
+            input,
+        } => {
+            let result = {
+                let mut modules_lock = modules.lock().await;
+                if let Some(module) = modules_lock.get_mut(&module_id) {
+                    module
+                        .call_tool(crate::comm::ModuleToolCall {
+                            name: tool_name.clone(),
+                            input: input.clone(),
+                        })
+                        .await
+                        .map_err(|e| e.to_string())
+                } else {
+                    Err("Module not found".to_string())
+                }
+            };
+            match result {
+                Ok(res) => {
+                    let _ = dash_tx
+                        .send(DashboardCommand::PushThinkingLine(res.content))
+                        .await;
+                }
+                Err(e) => {
+                    let _ = dash_tx
+                        .send(DashboardCommand::PushThinkingLine(format!(
+                            "Tool error: {}",
+                            e
+                        )))
+                        .await;
+                }
+            }
         }
-        IpcCommand::ScheduleTask { prompt, schedule_type, schedule_value, context_mode, target_jid, source_group } => {
-            let is_main = config.is_main_group(&source_group);
-            if !is_main {
-                if let Some(target) = registered_groups.get(&target_jid) {
-                    if target.folder != source_group {
-                        warn!(source_group, target_jid, "Unauthorized schedule_task blocked");
-                        return;
+        IpcCommand::SendMessage { addr, text } => {
+            info!(%addr, "IPC: send_message");
+            if addr.module_id == "terminal" {
+                let _ = dash_tx.send(DashboardCommand::PushThinkingLine(text)).await;
+                return;
+            }
+            let mut modules_lock = modules.lock().await;
+            if let Some(module) = modules_lock.get_mut(&addr.module_id) {
+                if let Err(e) = module
+                    .send_command(ModuleCommand::SendMessage {
+                        channel_id: addr.channel_id,
+                        text,
+                    })
+                    .await
+                {
+                    error!(%addr.module_id, "Failed to send message via module: {}", e);
+                }
+            } else {
+                warn!(%addr, "No module found for send_message");
+            }
+        }
+        IpcCommand::ScheduleTask {
+            prompt,
+            schedule_type,
+            schedule_value,
+            context_mode,
+            target_addr,
+            source_group,
+        } => {
+            if let Some(module) = modules.lock().await.get_mut(&target_addr.module_id) {
+                let has_auth_tool = module
+                    .tools()
+                    .iter()
+                    .any(|t| t.name == "authorize_schedule_task");
+                if has_auth_tool {
+                    let result = module
+                        .call_tool(crate::comm::ModuleToolCall {
+                            name: "authorize_schedule_task".into(),
+                            input: serde_json::json!({
+                                "source_group": source_group,
+                                "target_jid": target_addr.channel_id
+                            }),
+                        })
+                        .await
+                        .map_err(|e| e.to_string());
+                    if let Ok(res) = result {
+                        if res.is_error {
+                            warn!(%target_addr, "Unauthorized schedule_task blocked");
+                            return;
+                        }
                     }
                 }
             }
 
-            let task_id = format!("task-{}-{}", chrono::Utc::now().timestamp_millis(), &uuid::Uuid::new_v4().to_string()[..6]);
+            let is_main = config.is_main_group(&source_group);
+            let task_id = format!(
+                "task-{}-{}",
+                chrono::Utc::now().timestamp_millis(),
+                &uuid::Uuid::new_v4().to_string()[..6]
+            );
             let now = chrono::Utc::now().to_rfc3339();
-            let target_folder = registered_groups.get(&target_jid)
-                .map(|g| g.folder.clone())
-                .unwrap_or(source_group);
+            let target_folder = if is_main {
+                source_group.clone()
+            } else {
+                source_group.clone()
+            };
 
-            let stype = types::ScheduleType::from_str(&schedule_type).unwrap_or(types::ScheduleType::Once);
+            let stype =
+                types::ScheduleType::from_str(&schedule_type).unwrap_or(types::ScheduleType::Once);
             let cmode = types::ContextMode::from_str(&context_mode);
 
             let task = types::ScheduledTask {
                 id: task_id.clone(),
                 group_folder: target_folder,
-                chat_jid: target_jid,
+                chat_jid: target_addr.channel_id.clone(),
                 prompt,
                 schedule_type: stype,
                 schedule_value,
@@ -430,6 +685,7 @@ async fn handle_ipc_command(
                 last_result: None,
                 status: types::TaskStatus::Active,
                 created_at: now,
+                module_id: target_addr.module_id,
             };
 
             let next_run = scheduler::calculate_next_run(&task);
@@ -442,7 +698,10 @@ async fn handle_ipc_command(
                 info!(%task_id, "Task created via IPC");
             }
         }
-        IpcCommand::PauseTask { task_id, source_group } => {
+        IpcCommand::PauseTask {
+            task_id,
+            source_group,
+        } => {
             let is_main = config.is_main_group(&source_group);
             if let Ok(Some(task)) = db.get_task_by_id(&task_id) {
                 if is_main || task.group_folder == source_group {
@@ -451,7 +710,10 @@ async fn handle_ipc_command(
                 }
             }
         }
-        IpcCommand::ResumeTask { task_id, source_group } => {
+        IpcCommand::ResumeTask {
+            task_id,
+            source_group,
+        } => {
             let is_main = config.is_main_group(&source_group);
             if let Ok(Some(task)) = db.get_task_by_id(&task_id) {
                 if is_main || task.group_folder == source_group {
@@ -460,7 +722,10 @@ async fn handle_ipc_command(
                 }
             }
         }
-        IpcCommand::CancelTask { task_id, source_group } => {
+        IpcCommand::CancelTask {
+            task_id,
+            source_group,
+        } => {
             let is_main = config.is_main_group(&source_group);
             if let Ok(Some(task)) = db.get_task_by_id(&task_id) {
                 if is_main || task.group_folder == source_group {
@@ -469,40 +734,29 @@ async fn handle_ipc_command(
                 }
             }
         }
-        IpcCommand::RegisterGroup { jid, name, folder, trigger } => {
-            let group = RegisteredGroup {
-                name: name.clone(),
-                folder: folder.clone(),
-                trigger,
-                added_at: chrono::Utc::now().to_rfc3339(),
-                requires_trigger: None,
-            };
-            let _ = db.set_registered_group(&jid, &group);
-            registered_groups.insert(jid.clone(), group);
-
-            let group_dir = config.groups_dir.join(&folder);
-            let _ = std::fs::create_dir_all(group_dir.join("logs"));
-
-            let groups: HashMap<String, GroupDisplay> = registered_groups
-                .iter()
-                .map(|(jid, g)| (jid.clone(), GroupDisplay {
-                    name: g.name.clone(),
-                    folder: g.folder.clone(),
-                    status: GroupDisplayStatus::Idle,
-                }))
-                .collect();
-            let _ = dash_tx.send(DashboardCommand::SetGroups(groups)).await;
-            info!(jid, name, folder, "Group registered via IPC");
-        }
-        IpcCommand::RefreshGroups => {
-            info!("Group refresh requested via IPC");
-        }
     }
 }
 
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+fn format_all_module_tools(tools_by_module: Vec<(String, Vec<ModuleToolDefinition>)>) -> String {
+    let mut out = String::new();
+    out.push_str("[module_tools]\n");
+    out.push_str("Tools (call via module_tool with module_id/tool_name):\n");
+
+    let mut any = false;
+    for (module_id, tools) in tools_by_module {
+        for t in tools {
+            any = true;
+            let schema = serde_json::to_string(&t.input_schema).unwrap_or_else(|_| "{}".into());
+            out.push_str(&format!("- name: {}.{}\n", module_id, t.name));
+            out.push_str(&format!("  desc: {}\n", t.description));
+            out.push_str(&format!("  schema: {}\n", schema));
+        }
+    }
+
+    if !any {
+        out.push_str("none\n");
+    }
+
+    out.push_str("[/module_tools]\n");
+    out
 }

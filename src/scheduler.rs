@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use cron::Schedule;
 use chrono::Utc;
+use cron::Schedule;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::db::Database;
-use crate::types::{ScheduleType, ScheduledTask, TaskRunLog, RunStatus, TaskStatus};
+use crate::types::{RunStatus, ScheduleType, ScheduledTask, TaskRunLog, TaskStatus};
 
 pub struct Scheduler {
     db: Arc<Database>,
@@ -69,7 +69,7 @@ impl Scheduler {
                 continue;
             }
 
-            // Run the task (in the future, this would go through the GroupQueue)
+            // Run the task (in the future, this would go through the ModuleQueue)
             self.execute_task(&current).await;
         }
     }
@@ -86,11 +86,10 @@ impl Scheduler {
         let next_run = calculate_next_run(task);
 
         let result_summary = "Task execution delegated to agent loop";
-        if let Err(e) = self.db.update_task_after_run(
-            &task.id,
-            next_run.as_deref(),
-            result_summary,
-        ) {
+        if let Err(e) = self
+            .db
+            .update_task_after_run(&task.id, next_run.as_deref(), result_summary)
+        {
             error!(task_id = %task.id, "Failed to update task after run: {}", e);
         }
 
@@ -112,10 +111,7 @@ pub fn calculate_next_run(task: &ScheduledTask) -> Option<String> {
         ScheduleType::Cron => {
             // Parse cron expression and get next occurrence
             match task.schedule_value.parse::<Schedule>() {
-                Ok(schedule) => schedule
-                    .upcoming(Utc)
-                    .next()
-                    .map(|t| t.to_rfc3339()),
+                Ok(schedule) => schedule.upcoming(Utc).next().map(|t| t.to_rfc3339()),
                 Err(e) => {
                     warn!(task_id = %task.id, "Invalid cron expression: {}", e);
                     None

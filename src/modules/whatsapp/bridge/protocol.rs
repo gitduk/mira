@@ -4,10 +4,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BridgeCommand {
-    SendMessage {
-        jid: String,
-        text: String,
-    },
+    SendMessage { jid: String, text: String },
     FetchGroups,
     Shutdown,
 }

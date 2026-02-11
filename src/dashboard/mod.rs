@@ -24,8 +24,6 @@ pub enum DashboardCommand {
     SetModules(Vec<Module>),
     SetModuleStatus(String, ModuleStatus),
     SetModuleMounted(String, bool),
-    SetGroups(std::collections::HashMap<String, state::GroupDisplay>),
-    SetGroupStatus(String, state::GroupDisplayStatus),
     SetActiveAgents(usize),
     IncrementMessages(usize),
     PushThinkingLine(String),
@@ -48,12 +46,19 @@ impl Dashboard {
         max_agents: usize,
         api_base_url: String,
         claude_model: String,
+        max_thinking_lines: usize,
         cmd_rx: mpsc::Receiver<DashboardCommand>,
         shutdown_rx: watch::Receiver<bool>,
         input_tx: Option<mpsc::Sender<String>>,
     ) -> Self {
         Dashboard {
-            state: DashboardState::new(agent_name, max_agents, api_base_url, claude_model),
+            state: DashboardState::new(
+                agent_name,
+                max_agents,
+                api_base_url,
+                claude_model,
+                max_thinking_lines,
+            ),
             cmd_rx,
             shutdown_rx,
             input_tx,
@@ -61,7 +66,7 @@ impl Dashboard {
         }
     }
 
-    pub async fn run(mut self) -> io::Result<()> {
+    pub fn run(mut self) -> io::Result<()> {
         // Setup terminal
         enable_raw_mode()?;
         io::stdout().execute(EnterAlternateScreen)?;
@@ -128,14 +133,6 @@ impl Dashboard {
             DashboardCommand::SetModuleMounted(id, mounted) => {
                 if let Some(m) = self.state.modules.iter_mut().find(|m| m.id == id) {
                     m.mounted = mounted;
-                }
-            }
-            DashboardCommand::SetGroups(groups) => {
-                self.state.groups = groups;
-            }
-            DashboardCommand::SetGroupStatus(jid, status) => {
-                if let Some(group) = self.state.groups.get_mut(&jid) {
-                    group.status = status;
                 }
             }
             DashboardCommand::SetActiveAgents(count) => {

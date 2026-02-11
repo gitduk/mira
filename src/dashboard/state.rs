@@ -1,26 +1,9 @@
-use std::collections::HashMap;
-
 use crate::module::Module;
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum GroupDisplayStatus {
-    Idle,
-    Running,
-    Queued,
-}
-
-#[derive(Debug, Clone)]
-pub struct GroupDisplay {
-    pub name: String,
-    pub folder: String,
-    pub status: GroupDisplayStatus,
-}
 
 pub struct DashboardState {
     pub agent_name: String,
     pub max_agents: usize,
     pub modules: Vec<Module>,
-    pub groups: HashMap<String, GroupDisplay>,
     pub active_agents: usize,
     pub message_count: usize,
     pub start_time: std::time::Instant,
@@ -32,15 +15,22 @@ pub struct DashboardState {
     pub input_mode: bool,
     pub api_base_url: String,
     pub claude_model: String,
+    pub max_thinking_lines: usize,
+    pub scroll_offset: usize,
 }
 
 impl DashboardState {
-    pub fn new(agent_name: String, max_agents: usize, api_base_url: String, claude_model: String) -> Self {
+    pub fn new(
+        agent_name: String,
+        max_agents: usize,
+        api_base_url: String,
+        claude_model: String,
+        max_thinking_lines: usize,
+    ) -> Self {
         DashboardState {
             agent_name,
             max_agents,
             modules: Vec::new(),
-            groups: HashMap::new(),
             active_agents: 0,
             message_count: 0,
             start_time: std::time::Instant::now(),
@@ -52,13 +42,18 @@ impl DashboardState {
             input_mode: false,
             api_base_url,
             claude_model,
+            max_thinking_lines,
+            scroll_offset: 0,
         }
     }
 
     pub fn push_thinking_line(&mut self, line: String) {
         self.thinking_buffer.push(line);
-        if self.thinking_buffer.len() > 500 {
-            self.thinking_buffer.drain(0..self.thinking_buffer.len() - 500);
+        // Auto-follow new output
+        self.scroll_offset = 0;
+        if self.thinking_buffer.len() > self.max_thinking_lines {
+            let overflow = self.thinking_buffer.len() - self.max_thinking_lines;
+            self.thinking_buffer.drain(0..overflow);
         }
     }
 

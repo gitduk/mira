@@ -15,7 +15,10 @@ pub struct BridgeProcess {
 }
 
 impl BridgeProcess {
-    pub async fn spawn(bridge_dir: &Path, store_dir: &Path) -> Result<(Self, mpsc::Receiver<BridgeEvent>)> {
+    pub async fn spawn(
+        bridge_dir: &Path,
+        store_dir: &Path,
+    ) -> Result<(Self, mpsc::Receiver<BridgeEvent>)> {
         let bridge_script = bridge_dir.join("src/index.ts");
 
         // Use npx tsx or bun to run TypeScript directly
@@ -76,7 +79,11 @@ impl BridgeProcess {
                         }
                     }
                     Err(e) => {
-                        warn!("Failed to parse bridge event: {} - line: {}", e, &line[..line.len().min(200)]);
+                        warn!(
+                            "Failed to parse bridge event: {} - line: {}",
+                            e,
+                            &line[..line.len().min(200)]
+                        );
                     }
                 }
             }
@@ -94,10 +101,7 @@ impl BridgeProcess {
             }
         });
 
-        Ok((
-            BridgeProcess { child, stdin_tx },
-            event_rx,
-        ))
+        Ok((BridgeProcess { child, stdin_tx }, event_rx))
     }
 
     pub async fn send_command(&self, cmd: &BridgeCommand) -> Result<()> {

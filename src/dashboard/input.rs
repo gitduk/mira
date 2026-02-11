@@ -15,8 +15,8 @@ pub fn handle_key_event(event: KeyEvent, state: &mut DashboardState) -> InputAct
         return InputAction::Quit;
     }
 
-    // Ctrl+D: toggle input mode
-    if event.modifiers.contains(KeyModifiers::CONTROL) && event.code == KeyCode::Char('d') {
+    // Tab: toggle input mode
+    if event.code == KeyCode::Tab {
         state.input_mode = !state.input_mode;
         if !state.input_mode {
             state.input_buffer.clear();
@@ -26,11 +26,32 @@ pub fn handle_key_event(event: KeyEvent, state: &mut DashboardState) -> InputAct
     }
 
     if !state.input_mode {
+        match event.code {
+            KeyCode::Up => {
+                state.scroll_offset = state.scroll_offset.saturating_add(1);
+            }
+            KeyCode::Down => {
+                state.scroll_offset = state.scroll_offset.saturating_sub(1);
+            }
+            KeyCode::PageUp => {
+                state.scroll_offset = state.scroll_offset.saturating_add(10);
+            }
+            KeyCode::PageDown => {
+                state.scroll_offset = state.scroll_offset.saturating_sub(10);
+            }
+            KeyCode::Home => {
+                state.scroll_offset = usize::MAX;
+            }
+            KeyCode::End => {
+                state.scroll_offset = 0;
+            }
+            _ => {}
+        }
         return InputAction::None;
     }
 
     match event.code {
-        KeyCode::Enter => {
+        KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r') => {
             let input = state.input_buffer.trim().to_string();
             state.input_buffer.clear();
             state.cursor_pos = 0;

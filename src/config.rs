@@ -1,6 +1,6 @@
+use regex::Regex;
 use std::io::IsTerminal;
 use std::path::PathBuf;
-use regex::Regex;
 
 pub struct Config {
     pub assistant_name: String,
@@ -15,6 +15,7 @@ pub struct Config {
     pub trigger_pattern: Regex,
     pub timezone: String,
     pub dashboard_enabled: bool,
+    pub dashboard_max_lines: usize,
     pub claude_model: String,
     pub log_level: String,
     pub api_base_url: String,
@@ -34,8 +35,8 @@ impl Config {
             .max(1);
 
         let escaped_name = regex::escape(&assistant_name);
-        let trigger_pattern = Regex::new(&format!("(?i)^@{}\\b", escaped_name))
-            .expect("Invalid trigger pattern");
+        let trigger_pattern =
+            Regex::new(&format!("(?i)^@{}\\b", escaped_name)).expect("Invalid trigger pattern");
 
         let timezone = std::env::var("TZ").unwrap_or_else(|_| "UTC".into());
 
@@ -43,9 +44,14 @@ impl Config {
             && std::env::var("DASHBOARD")
                 .map(|v| v != "false")
                 .unwrap_or(true);
+        let dashboard_max_lines = std::env::var("DASHBOARD_MAX_LINES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(500)
+            .max(50);
 
-        let claude_model = std::env::var("CLAUDE_MODEL")
-            .unwrap_or_else(|_| "claude-sonnet-4.5".into());
+        let claude_model =
+            std::env::var("CLAUDE_MODEL").unwrap_or_else(|_| "claude-sonnet-4.5".into());
 
         let log_level = std::env::var("LOG_LEVEL").unwrap_or_else(|_| "info".into());
 
@@ -66,6 +72,7 @@ impl Config {
             trigger_pattern,
             timezone,
             dashboard_enabled,
+            dashboard_max_lines,
             claude_model,
             log_level,
             api_base_url,

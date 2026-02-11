@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::error;
 
+use crate::comm::ChannelAddr;
 use crate::config::Config;
 use crate::db::Database;
 use crate::types::IpcCommand;
@@ -45,9 +46,10 @@ pub struct AgentInput {
     pub prompt: String,
     pub session_id: Option<String>,
     pub group_folder: String,
-    pub chat_jid: String,
+    pub addr: ChannelAddr,
     pub is_main: bool,
     pub is_scheduled_task: bool,
+    pub persist_session: bool,
     pub workspace_dir: PathBuf,
     pub global_claude_md: Option<String>,
 }
@@ -76,7 +78,7 @@ pub async fn run_agent(
     let tool_ctx = tools::ToolContext {
         workspace_dir: input.workspace_dir.clone(),
         group_folder: input.group_folder.clone(),
-        chat_jid: input.chat_jid.clone(),
+        addr: input.addr.clone(),
         is_main: input.is_main,
         ipc_sender: ipc_tx,
         db: db.clone(),
@@ -100,6 +102,7 @@ pub async fn run_agent(
     let session = session::Session::load_or_create(
         &input.workspace_dir,
         input.session_id.as_deref(),
+        input.persist_session,
     );
 
     // Run the agentic loop
@@ -122,8 +125,10 @@ pub async fn run_agent(
     match result {
         Ok(Ok(loop_result)) => {
             // Save session
-            if let Err(e) = session.save(&input.workspace_dir) {
-                error!("Failed to save session: {}", e);
+            if input.persist_session {
+                if let Err(e) = session.save(&input.workspace_dir) {
+                    error!("Failed to save session: {}", e);
+                }
             }
 
             AgentOutput {

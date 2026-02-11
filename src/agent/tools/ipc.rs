@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::{Tool, ToolContext, ToolResult};
+use crate::comm::ChannelAddr;
 use crate::types::IpcCommand;
 
 // --- send_message ---
@@ -24,6 +25,14 @@ impl Tool for SendMessageTool {
                 "text": {
                     "type": "string",
                     "description": "The message text to send"
+                },
+                "module_id": {
+                    "type": "string",
+                    "description": "Target module (e.g. 'whatsapp', 'telegram'). Defaults to current module."
+                },
+                "channel_id": {
+                    "type": "string",
+                    "description": "Target channel within the module. Defaults to current channel."
                 }
             },
             "required": ["text"]
@@ -36,9 +45,14 @@ impl Tool for SendMessageTool {
             return Ok(ToolResult::error("text is required".into()));
         }
 
+        let target_addr = ChannelAddr::new(
+            input["module_id"].as_str().unwrap_or(&ctx.addr.module_id),
+            input["channel_id"].as_str().unwrap_or(&ctx.addr.channel_id),
+        );
+
         ctx.ipc_sender
             .send(IpcCommand::SendMessage {
-                chat_jid: ctx.chat_jid.clone(),
+                addr: target_addr,
                 text: text.to_string(),
             })
             .await
@@ -83,9 +97,13 @@ impl Tool for ScheduleTaskTool {
                     "enum": ["group", "isolated"],
                     "description": "group=with chat history, isolated=fresh session"
                 },
-                "target_group_jid": {
+                "target_module_id": {
                     "type": "string",
-                    "description": "JID of target group (main only, defaults to current)"
+                    "description": "Target module (main only, defaults to current)"
+                },
+                "target_channel_id": {
+                    "type": "string",
+                    "description": "Target channel (main only, defaults to current)"
                 }
             },
             "required": ["prompt", "schedule_type", "schedule_value"]
@@ -97,10 +115,15 @@ impl Tool for ScheduleTaskTool {
         let schedule_type = input["schedule_type"].as_str().unwrap_or_default();
         let schedule_value = input["schedule_value"].as_str().unwrap_or_default();
         let context_mode = input["context_mode"].as_str().unwrap_or("group");
-        let target_jid = input["target_group_jid"]
+
+        let target_module = input["target_module_id"]
             .as_str()
             .filter(|_| ctx.is_main)
-            .unwrap_or(&ctx.chat_jid);
+            .unwrap_or(&ctx.addr.module_id);
+        let target_channel = input["target_channel_id"]
+            .as_str()
+            .filter(|_| ctx.is_main)
+            .unwrap_or(&ctx.addr.channel_id);
 
         if prompt.is_empty() || schedule_type.is_empty() || schedule_value.is_empty() {
             return Ok(ToolResult::error(
@@ -114,7 +137,7 @@ impl Tool for ScheduleTaskTool {
                 schedule_type: schedule_type.to_string(),
                 schedule_value: schedule_value.to_string(),
                 context_mode: context_mode.to_string(),
-                target_jid: target_jid.to_string(),
+                target_addr: ChannelAddr::new(target_module, target_channel),
                 source_group: ctx.group_folder.clone(),
             })
             .await
@@ -322,76 +345,54 @@ impl Tool for CancelTaskTool {
     }
 }
 
-// --- register_group ---
-pub struct RegisterGroupTool;
+// --- module_tool ---
+pub struct ModuleToolCallTool;
 
 #[async_trait]
-impl Tool for RegisterGroupTool {
+impl Tool for ModuleToolCallTool {
     fn name(&self) -> &str {
-        "register_group"
+        "module_tool"
     }
 
     fn description(&self) -> &str {
-        "Register a new WhatsApp group. Main group only."
+        "Call a module-specific tool."
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "jid": {
-                    "type": "string",
-                    "description": "The WhatsApp JID"
-                },
-                "name": {
-                    "type": "string",
-                    "description": "Display name for the group"
-                },
-                "folder": {
-                    "type": "string",
-                    "description": "Folder name (lowercase, hyphens)"
-                },
-                "trigger": {
-                    "type": "string",
-                    "description": "Trigger word (e.g. '@Mira')"
-                }
+                "module_id": { "type": "string" },
+                "tool_name": { "type": "string" },
+                "input": { "type": "object" }
             },
-            "required": ["jid", "name", "folder", "trigger"]
+            "required": ["module_id", "tool_name"]
         })
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext) -> crate::error::Result<ToolResult> {
-        if !ctx.is_main {
-            return Ok(ToolResult::error(
-                "Only the main group can register new groups.".into(),
-            ));
-        }
+        let module_id = input["module_id"].as_str().unwrap_or_default();
+        let tool_name = input["tool_name"].as_str().unwrap_or_default();
+        let tool_input = input.get("input").cloned().unwrap_or_else(|| json!({}));
 
-        let jid = input["jid"].as_str().unwrap_or_default();
-        let name = input["name"].as_str().unwrap_or_default();
-        let folder = input["folder"].as_str().unwrap_or_default();
-        let trigger = input["trigger"].as_str().unwrap_or_default();
-
-        if jid.is_empty() || name.is_empty() || folder.is_empty() || trigger.is_empty() {
+        if module_id.is_empty() || tool_name.is_empty() {
             return Ok(ToolResult::error(
-                "jid, name, folder, and trigger are all required".into(),
+                "module_id and tool_name are required".into(),
             ));
         }
 
         ctx.ipc_sender
-            .send(IpcCommand::RegisterGroup {
-                jid: jid.to_string(),
-                name: name.to_string(),
-                folder: folder.to_string(),
-                trigger: trigger.to_string(),
+            .send(IpcCommand::CallModuleTool {
+                module_id: module_id.to_string(),
+                tool_name: tool_name.to_string(),
+                input: tool_input,
             })
             .await
             .map_err(|e| crate::error::MiraError::Tool(format!("Failed to send IPC: {}", e)))?;
 
         Ok(ToolResult::ok(format!(
-            "Group \"{}\" registered. It will start receiving messages immediately.",
-            name
+            "Module tool request queued: {}.{}",
+            module_id, tool_name
         )))
     }
 }
-

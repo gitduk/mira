@@ -16,13 +16,14 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::agent::api::ToolDefinition;
+use crate::comm::ChannelAddr;
 use crate::db::Database;
 use crate::types::IpcCommand;
 
 pub struct ToolContext {
     pub workspace_dir: PathBuf,
     pub group_folder: String,
-    pub chat_jid: String,
+    pub addr: ChannelAddr,
     pub is_main: bool,
     pub ipc_sender: mpsc::Sender<IpcCommand>,
     pub db: Arc<Database>,
@@ -79,7 +80,7 @@ impl ToolRegistry {
             Box::new(ipc::PauseTaskTool),
             Box::new(ipc::ResumeTaskTool),
             Box::new(ipc::CancelTaskTool),
-            Box::new(ipc::RegisterGroupTool),
+            Box::new(ipc::ModuleToolCallTool),
         ];
 
         ToolRegistry { tools, ctx }

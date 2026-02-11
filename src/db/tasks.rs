@@ -7,8 +7,8 @@ impl Database {
     pub fn create_task(&self, task: &ScheduledTask) -> Result<()> {
         let conn = self.conn();
         conn.execute(
-            "INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, next_run, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, next_run, status, created_at, module_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 task.id,
                 task.group_folder,
@@ -20,6 +20,7 @@ impl Database {
                 task.next_run,
                 task.status.as_str(),
                 task.created_at,
+                task.module_id,
             ],
         )?;
         Ok(())
@@ -27,11 +28,12 @@ impl Database {
 
     pub fn get_task_by_id(&self, id: &str) -> Result<Option<ScheduledTask>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT * FROM scheduled_tasks WHERE id = ?1")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, group_folder, chat_jid, prompt, schedule_type, schedule_value, next_run, last_run, last_result, status, created_at, context_mode, module_id
+             FROM scheduled_tasks WHERE id = ?1",
+        )?;
         let result = stmt
-            .query_row(rusqlite::params![id], |row| {
-                Ok(row_to_task(row))
-            })
+            .query_row(rusqlite::params![id], |row| Ok(row_to_task(row)))
             .ok();
         Ok(result)
     }
@@ -39,11 +41,10 @@ impl Database {
     pub fn get_tasks_for_group(&self, group_folder: &str) -> Result<Vec<ScheduledTask>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT * FROM scheduled_tasks WHERE group_folder = ?1 ORDER BY created_at DESC",
+            "SELECT id, group_folder, chat_jid, prompt, schedule_type, schedule_value, next_run, last_run, last_result, status, created_at, context_mode, module_id
+             FROM scheduled_tasks WHERE group_folder = ?1 ORDER BY created_at DESC",
         )?;
-        let rows = stmt.query_map(rusqlite::params![group_folder], |row| {
-            Ok(row_to_task(row))
-        })?;
+        let rows = stmt.query_map(rusqlite::params![group_folder], |row| Ok(row_to_task(row)))?;
 
         let mut tasks = Vec::new();
         for row in rows {
@@ -54,8 +55,10 @@ impl Database {
 
     pub fn get_all_tasks(&self) -> Result<Vec<ScheduledTask>> {
         let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT * FROM scheduled_tasks ORDER BY created_at DESC")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, group_folder, chat_jid, prompt, schedule_type, schedule_value, next_run, last_run, last_result, status, created_at, context_mode, module_id
+             FROM scheduled_tasks ORDER BY created_at DESC",
+        )?;
         let rows = stmt.query_map([], |row| Ok(row_to_task(row)))?;
 
         let mut tasks = Vec::new();
@@ -126,8 +129,14 @@ impl Database {
 
     pub fn delete_task(&self, id: &str) -> Result<()> {
         let conn = self.conn();
-        conn.execute("DELETE FROM task_run_logs WHERE task_id = ?1", rusqlite::params![id])?;
-        conn.execute("DELETE FROM scheduled_tasks WHERE id = ?1", rusqlite::params![id])?;
+        conn.execute(
+            "DELETE FROM task_run_logs WHERE task_id = ?1",
+            rusqlite::params![id],
+        )?;
+        conn.execute(
+            "DELETE FROM scheduled_tasks WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
         Ok(())
     }
 
@@ -135,7 +144,8 @@ impl Database {
         let conn = self.conn();
         let now = chrono::Utc::now().to_rfc3339();
         let mut stmt = conn.prepare(
-            "SELECT * FROM scheduled_tasks
+            "SELECT id, group_folder, chat_jid, prompt, schedule_type, schedule_value, next_run, last_run, last_result, status, created_at, context_mode, module_id
+             FROM scheduled_tasks
              WHERE status = 'active' AND next_run IS NOT NULL AND next_run <= ?1
              ORDER BY next_run",
         )?;
@@ -190,10 +200,8 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> ScheduledTask {
         group_folder: row.get(1).unwrap_or_default(),
         chat_jid: row.get(2).unwrap_or_default(),
         prompt: row.get(3).unwrap_or_default(),
-        schedule_type: ScheduleType::from_str(
-            &row.get::<_, String>(4).unwrap_or_default(),
-        )
-        .unwrap_or(ScheduleType::Once),
+        schedule_type: ScheduleType::from_str(&row.get::<_, String>(4).unwrap_or_default())
+            .unwrap_or(ScheduleType::Once),
         schedule_value: row.get(5).unwrap_or_default(),
         next_run: row.get(6).ok(),
         last_run: row.get(7).ok(),
@@ -201,7 +209,11 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> ScheduledTask {
         status: TaskStatus::from_str(&row.get::<_, String>(9).unwrap_or_default()),
         created_at: row.get(10).unwrap_or_default(),
         context_mode: ContextMode::from_str(
-            &row.get::<_, String>(11).unwrap_or_else(|_| "isolated".into()),
+            &row.get::<_, String>(11)
+                .unwrap_or_else(|_| "isolated".into()),
         ),
+        module_id: row
+            .get::<_, String>(12)
+            .unwrap_or_else(|_| "whatsapp".into()),
     }
 }

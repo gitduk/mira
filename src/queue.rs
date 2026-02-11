@@ -6,54 +6,36 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
 
-const MAX_RETRIES: u32 = 5;
-const BASE_RETRY_MS: u64 = 5000;
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum GroupStatus {
-    Idle,
-    Running,
-    Queued,
-}
-
 type ProcessFn = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
 
-struct GroupState {
+struct ModuleState {
     active: bool,
-    pending_messages: bool,
-    pending_tasks: VecDeque<QueuedTask>,
-    retry_count: u32,
+    pending: bool,
 }
 
-struct QueuedTask {
-    id: String,
-    group_jid: String,
-    task_fn: Pin<Box<dyn Future<Output = ()> + Send>>,
-}
-
-pub struct GroupQueue {
-    inner: Arc<Mutex<GroupQueueInner>>,
+pub struct ModuleQueue {
+    inner: Arc<Mutex<ModuleQueueInner>>,
     shutdown_notify: Arc<Notify>,
 }
 
-struct GroupQueueInner {
-    groups: HashMap<String, GroupState>,
+struct ModuleQueueInner {
+    modules: HashMap<String, ModuleState>,
     active_count: usize,
     max_concurrent: usize,
-    waiting_groups: VecDeque<String>,
+    waiting_modules: VecDeque<String>,
     process_fn: Option<ProcessFn>,
     shutting_down: bool,
     on_state_change: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
-impl GroupQueue {
+impl ModuleQueue {
     pub fn new(max_concurrent: usize) -> Self {
-        GroupQueue {
-            inner: Arc::new(Mutex::new(GroupQueueInner {
-                groups: HashMap::new(),
+        ModuleQueue {
+            inner: Arc::new(Mutex::new(ModuleQueueInner {
+                modules: HashMap::new(),
                 active_count: 0,
                 max_concurrent,
-                waiting_groups: VecDeque::new(),
+                waiting_modules: VecDeque::new(),
                 process_fn: None,
                 shutting_down: false,
                 on_state_change: None,
@@ -77,63 +59,45 @@ impl GroupQueue {
         inner.active_count
     }
 
-    pub async fn get_group_status(&self, group_jid: &str) -> GroupStatus {
-        let inner = self.inner.lock().await;
-        match inner.groups.get(group_jid) {
-            None => GroupStatus::Idle,
-            Some(state) => {
-                if state.active {
-                    GroupStatus::Running
-                } else if state.pending_messages || !state.pending_tasks.is_empty() {
-                    GroupStatus::Queued
-                } else {
-                    GroupStatus::Idle
-                }
-            }
-        }
-    }
-
-    pub async fn enqueue_message_check(&self, group_jid: String) {
+    pub async fn enqueue_module(&self, module_id: String) {
         let mut inner = self.inner.lock().await;
         if inner.shutting_down {
             return;
         }
 
-        // Ensure group entry exists
-        inner.groups.entry(group_jid.clone()).or_insert(GroupState {
-            active: false,
-            pending_messages: false,
-            pending_tasks: VecDeque::new(),
-            retry_count: 0,
-        });
+        inner
+            .modules
+            .entry(module_id.clone())
+            .or_insert(ModuleState {
+                active: false,
+                pending: false,
+            });
 
-        // Now access via get_mut so the borrow is scoped properly
-        let is_active = inner.groups.get(&group_jid).map_or(false, |s| s.active);
+        let is_active = inner.modules.get(&module_id).map_or(false, |s| s.active);
 
         if is_active {
-            if let Some(state) = inner.groups.get_mut(&group_jid) {
-                state.pending_messages = true;
+            if let Some(state) = inner.modules.get_mut(&module_id) {
+                state.pending = true;
             }
-            debug!(group_jid, "Agent active, message queued");
+            debug!(module_id, "Module active, message queued");
             return;
         }
 
         if inner.active_count >= inner.max_concurrent {
-            if let Some(state) = inner.groups.get_mut(&group_jid) {
-                state.pending_messages = true;
+            if let Some(state) = inner.modules.get_mut(&module_id) {
+                state.pending = true;
             }
-            if !inner.waiting_groups.contains(&group_jid) {
-                inner.waiting_groups.push_back(group_jid);
+            if !inner.waiting_modules.contains(&module_id) {
+                inner.waiting_modules.push_back(module_id);
             }
             debug!("At concurrency limit, message queued");
             return;
         }
 
-        // Can run immediately
         let process_fn = inner.process_fn.clone();
-        if let Some(state) = inner.groups.get_mut(&group_jid) {
+        if let Some(state) = inner.modules.get_mut(&module_id) {
             state.active = true;
-            state.pending_messages = false;
+            state.pending = false;
         }
         inner.active_count += 1;
 
@@ -143,35 +107,31 @@ impl GroupQueue {
 
         let queue = self.inner.clone();
         let shutdown_notify = self.shutdown_notify.clone();
-        let jid = group_jid.clone();
+        let module_key = module_id.clone();
 
         drop(inner);
 
         tokio::spawn(async move {
             if let Some(process_fn) = process_fn {
-                let success = process_fn(jid.clone()).await;
+                let _success = process_fn(module_key.clone()).await;
                 let mut inner = queue.lock().await;
-                if let Some(state) = inner.groups.get_mut(&jid) {
-                    if success {
-                        state.retry_count = 0;
-                    }
+                if let Some(state) = inner.modules.get_mut(&module_key) {
                     state.active = false;
                 }
-                inner.active_count -= 1;
+                inner.active_count = inner.active_count.saturating_sub(1);
                 if let Some(ref cb) = inner.on_state_change {
                     cb();
                 }
 
-                // Drain
-                Self::drain_locked(&mut inner, &jid, queue.clone(), shutdown_notify);
+                Self::drain_locked(&mut inner, &module_key, queue.clone(), shutdown_notify);
             }
         });
     }
 
     fn drain_locked(
-        inner: &mut GroupQueueInner,
-        group_jid: &str,
-        queue: Arc<Mutex<GroupQueueInner>>,
+        inner: &mut ModuleQueueInner,
+        module_id: &str,
+        queue: Arc<Mutex<ModuleQueueInner>>,
         shutdown_notify: Arc<Notify>,
     ) {
         if inner.shutting_down {
@@ -181,42 +141,38 @@ impl GroupQueue {
             return;
         }
 
-        if let Some(state) = inner.groups.get_mut(group_jid) {
-            // Check for pending tasks first
-            if !state.pending_tasks.is_empty() {
-                // Tasks would need to be drained here
-                // For simplicity, check pending messages
-            }
-
-            if state.pending_messages && inner.active_count < inner.max_concurrent {
+        if let Some(state) = inner.modules.get_mut(module_id) {
+            if state.pending && inner.active_count < inner.max_concurrent {
                 let process_fn = inner.process_fn.clone();
                 state.active = true;
-                state.pending_messages = false;
+                state.pending = false;
                 inner.active_count += 1;
 
                 if let Some(ref cb) = inner.on_state_change {
                     cb();
                 }
 
-                let jid = group_jid.to_string();
+                let module_key = module_id.to_string();
                 let queue_clone = queue.clone();
                 let notify_clone = shutdown_notify.clone();
 
                 tokio::spawn(async move {
                     if let Some(process_fn) = process_fn {
-                        let success = process_fn(jid.clone()).await;
+                        let _success = process_fn(module_key.clone()).await;
                         let mut inner = queue_clone.lock().await;
-                        if let Some(state) = inner.groups.get_mut(&jid) {
-                            if success {
-                                state.retry_count = 0;
-                            }
+                        if let Some(state) = inner.modules.get_mut(&module_key) {
                             state.active = false;
                         }
-                        inner.active_count -= 1;
+                        inner.active_count = inner.active_count.saturating_sub(1);
                         if let Some(ref cb) = inner.on_state_change {
                             cb();
                         }
-                        Self::drain_locked(&mut inner, &jid, queue_clone.clone(), notify_clone);
+                        Self::drain_locked(
+                            &mut inner,
+                            &module_key,
+                            queue_clone.clone(),
+                            notify_clone,
+                        );
                     }
                 });
 
@@ -224,41 +180,37 @@ impl GroupQueue {
             }
         }
 
-        // Try drain waiting groups
-        while !inner.waiting_groups.is_empty() && inner.active_count < inner.max_concurrent {
-            if let Some(next_jid) = inner.waiting_groups.pop_front() {
-                if let Some(state) = inner.groups.get_mut(&next_jid) {
-                    if state.pending_messages {
+        while !inner.waiting_modules.is_empty() && inner.active_count < inner.max_concurrent {
+            if let Some(next_module) = inner.waiting_modules.pop_front() {
+                if let Some(state) = inner.modules.get_mut(&next_module) {
+                    if state.pending {
                         let process_fn = inner.process_fn.clone();
                         state.active = true;
-                        state.pending_messages = false;
+                        state.pending = false;
                         inner.active_count += 1;
 
                         if let Some(ref cb) = inner.on_state_change {
                             cb();
                         }
 
-                        let jid = next_jid.clone();
+                        let module_key = next_module.clone();
                         let queue_clone = queue.clone();
                         let notify_clone = shutdown_notify.clone();
 
                         tokio::spawn(async move {
                             if let Some(process_fn) = process_fn {
-                                let success = process_fn(jid.clone()).await;
+                                let _success = process_fn(module_key.clone()).await;
                                 let mut inner = queue_clone.lock().await;
-                                if let Some(state) = inner.groups.get_mut(&jid) {
-                                    if success {
-                                        state.retry_count = 0;
-                                    }
+                                if let Some(state) = inner.modules.get_mut(&module_key) {
                                     state.active = false;
                                 }
-                                inner.active_count -= 1;
+                                inner.active_count = inner.active_count.saturating_sub(1);
                                 if let Some(ref cb) = inner.on_state_change {
                                     cb();
                                 }
                                 Self::drain_locked(
                                     &mut inner,
-                                    &jid,
+                                    &module_key,
                                     queue_clone.clone(),
                                     notify_clone,
                                 );
@@ -276,7 +228,7 @@ impl GroupQueue {
             inner.shutting_down = true;
             info!(
                 active_count = inner.active_count,
-                "GroupQueue shutting down"
+                "ModuleQueue shutting down"
             );
 
             if inner.active_count == 0 {
@@ -284,7 +236,6 @@ impl GroupQueue {
             }
         }
 
-        // Wait for active agents to complete
         let timeout = tokio::time::Duration::from_millis(grace_period_ms);
         let _ = tokio::time::timeout(timeout, self.shutdown_notify.notified()).await;
 
@@ -292,7 +243,7 @@ impl GroupQueue {
         if inner.active_count > 0 {
             warn!(
                 active_count = inner.active_count,
-                "Some agents did not complete within grace period"
+                "Some modules did not complete within grace period"
             );
         }
     }

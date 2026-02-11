@@ -142,7 +142,7 @@ impl AnthropicClient {
                     // Only retry on specific errors
                     let should_retry = match &e {
                         MiraError::Http(req_err) => {
-                            req_err.status().map_or(false, |s| {
+                            req_err.status().is_some_and(|s| {
                                 s.as_u16() == 429 || s.as_u16() >= 500
                             })
                         }

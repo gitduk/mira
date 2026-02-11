@@ -7,11 +7,11 @@ impl Database {
     pub fn create_task(&self, task: &ScheduledTask) -> Result<()> {
         let conn = self.conn();
         conn.execute(
-            "INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, next_run, status, created_at, module_id)
+            "INSERT INTO scheduled_tasks (id, workspace, chat_jid, prompt, schedule_type, schedule_value, context_mode, next_run, status, created_at, module_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 task.id,
-                task.group_folder,
+                task.workspace,
                 task.chat_jid,
                 task.prompt,
                 task.schedule_type.as_str(),
@@ -29,7 +29,7 @@ impl Database {
     pub fn get_task_by_id(&self, id: &str) -> Result<Option<ScheduledTask>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, group_folder, chat_jid, prompt, schedule_type, schedule_value, next_run, last_run, last_result, status, created_at, context_mode, module_id
+            "SELECT id, workspace, chat_jid, prompt, schedule_type, schedule_value, next_run, last_run, last_result, status, created_at, context_mode, module_id
              FROM scheduled_tasks WHERE id = ?1",
         )?;
         let result = stmt
@@ -38,13 +38,13 @@ impl Database {
         Ok(result)
     }
 
-    pub fn get_tasks_for_group(&self, group_folder: &str) -> Result<Vec<ScheduledTask>> {
+    pub fn get_tasks_for_workspace(&self, workspace: &str) -> Result<Vec<ScheduledTask>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, group_folder, chat_jid, prompt, schedule_type, schedule_value, next_run, last_run, last_result, status, created_at, context_mode, module_id
-             FROM scheduled_tasks WHERE group_folder = ?1 ORDER BY created_at DESC",
+            "SELECT id, workspace, chat_jid, prompt, schedule_type, schedule_value, next_run, last_run, last_result, status, created_at, context_mode, module_id
+             FROM scheduled_tasks WHERE workspace = ?1 ORDER BY created_at DESC",
         )?;
-        let rows = stmt.query_map(rusqlite::params![group_folder], |row| Ok(row_to_task(row)))?;
+        let rows = stmt.query_map(rusqlite::params![workspace], |row| Ok(row_to_task(row)))?;
 
         let mut tasks = Vec::new();
         for row in rows {
@@ -56,7 +56,7 @@ impl Database {
     pub fn get_all_tasks(&self) -> Result<Vec<ScheduledTask>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, group_folder, chat_jid, prompt, schedule_type, schedule_value, next_run, last_run, last_result, status, created_at, context_mode, module_id
+            "SELECT id, workspace, chat_jid, prompt, schedule_type, schedule_value, next_run, last_run, last_result, status, created_at, context_mode, module_id
              FROM scheduled_tasks ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], |row| Ok(row_to_task(row)))?;
@@ -66,6 +66,16 @@ impl Database {
             tasks.push(row?);
         }
         Ok(tasks)
+    }
+
+    pub fn get_active_task_count(&self) -> Result<usize> {
+        let conn = self.conn();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM scheduled_tasks WHERE status = 'active'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as usize)
     }
 
     pub fn update_task_status(&self, id: &str, status: &TaskStatus) -> Result<()> {
@@ -144,7 +154,7 @@ impl Database {
         let conn = self.conn();
         let now = chrono::Utc::now().to_rfc3339();
         let mut stmt = conn.prepare(
-            "SELECT id, group_folder, chat_jid, prompt, schedule_type, schedule_value, next_run, last_run, last_result, status, created_at, context_mode, module_id
+            "SELECT id, workspace, chat_jid, prompt, schedule_type, schedule_value, next_run, last_run, last_result, status, created_at, context_mode, module_id
              FROM scheduled_tasks
              WHERE status = 'active' AND next_run IS NOT NULL AND next_run <= ?1
              ORDER BY next_run",
@@ -197,7 +207,7 @@ impl Database {
 fn row_to_task(row: &rusqlite::Row<'_>) -> ScheduledTask {
     ScheduledTask {
         id: row.get(0).unwrap_or_default(),
-        group_folder: row.get(1).unwrap_or_default(),
+        workspace: row.get(1).unwrap_or_default(),
         chat_jid: row.get(2).unwrap_or_default(),
         prompt: row.get(3).unwrap_or_default(),
         schedule_type: ScheduleType::from_str(&row.get::<_, String>(4).unwrap_or_default())

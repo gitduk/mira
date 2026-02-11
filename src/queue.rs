@@ -25,7 +25,7 @@ struct ModuleQueueInner {
     waiting_modules: VecDeque<String>,
     process_fn: Option<ProcessFn>,
     shutting_down: bool,
-    on_state_change: Option<Box<dyn Fn() + Send + Sync>>,
+    on_state_change: Option<Box<dyn Fn(usize, usize) + Send + Sync>>,
 }
 
 impl ModuleQueue {
@@ -49,7 +49,7 @@ impl ModuleQueue {
         inner.process_fn = Some(f);
     }
 
-    pub async fn set_on_state_change(&self, f: Box<dyn Fn() + Send + Sync>) {
+    pub async fn set_on_state_change(&self, f: Box<dyn Fn(usize, usize) + Send + Sync>) {
         let mut inner = self.inner.lock().await;
         inner.on_state_change = Some(f);
     }
@@ -73,7 +73,7 @@ impl ModuleQueue {
                 pending: false,
             });
 
-        let is_active = inner.modules.get(&module_id).map_or(false, |s| s.active);
+        let is_active = inner.modules.get(&module_id).is_some_and(|s| s.active);
 
         if is_active {
             if let Some(state) = inner.modules.get_mut(&module_id) {
@@ -102,7 +102,8 @@ impl ModuleQueue {
         inner.active_count += 1;
 
         if let Some(ref cb) = inner.on_state_change {
-            cb();
+            let pending_count = inner.modules.values().filter(|s| s.pending).count();
+            cb(inner.active_count, inner.active_count + pending_count);
         }
 
         let queue = self.inner.clone();
@@ -120,7 +121,8 @@ impl ModuleQueue {
                 }
                 inner.active_count = inner.active_count.saturating_sub(1);
                 if let Some(ref cb) = inner.on_state_change {
-                    cb();
+                    let pending_count = inner.modules.values().filter(|s| s.pending).count();
+                    cb(inner.active_count, inner.active_count + pending_count);
                 }
 
                 Self::drain_locked(&mut inner, &module_key, queue.clone(), shutdown_notify);
@@ -149,7 +151,8 @@ impl ModuleQueue {
                 inner.active_count += 1;
 
                 if let Some(ref cb) = inner.on_state_change {
-                    cb();
+                    let pending_count = inner.modules.values().filter(|s| s.pending).count();
+                    cb(inner.active_count, inner.active_count + pending_count);
                 }
 
                 let module_key = module_id.to_string();
@@ -165,7 +168,9 @@ impl ModuleQueue {
                         }
                         inner.active_count = inner.active_count.saturating_sub(1);
                         if let Some(ref cb) = inner.on_state_change {
-                            cb();
+                            let pending_count =
+                                inner.modules.values().filter(|s| s.pending).count();
+                            cb(inner.active_count, inner.active_count + pending_count);
                         }
                         Self::drain_locked(
                             &mut inner,
@@ -190,7 +195,9 @@ impl ModuleQueue {
                         inner.active_count += 1;
 
                         if let Some(ref cb) = inner.on_state_change {
-                            cb();
+                            let pending_count =
+                                inner.modules.values().filter(|s| s.pending).count();
+                            cb(inner.active_count, inner.active_count + pending_count);
                         }
 
                         let module_key = next_module.clone();
@@ -206,7 +213,9 @@ impl ModuleQueue {
                                 }
                                 inner.active_count = inner.active_count.saturating_sub(1);
                                 if let Some(ref cb) = inner.on_state_change {
-                                    cb();
+                                    let pending_count =
+                                        inner.modules.values().filter(|s| s.pending).count();
+                                    cb(inner.active_count, inner.active_count + pending_count);
                                 }
                                 Self::drain_locked(
                                     &mut inner,

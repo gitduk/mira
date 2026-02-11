@@ -131,13 +131,13 @@ pub trait CommunicationModule: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Get session id for a group folder (module-scoped).
-    async fn get_session_id(&self, _group_folder: &str) -> Result<Option<String>> {
+    /// Get session id for a workspace (module-scoped).
+    async fn get_session_id(&self, _workspace: &str) -> Result<Option<String>> {
         Ok(None)
     }
 
-    /// Persist session id for a group folder (module-scoped).
-    async fn set_session_id(&self, _group_folder: &str, _session_id: &str) -> Result<()> {
+    /// Persist session id for a workspace (module-scoped).
+    async fn set_session_id(&self, _workspace: &str, _session_id: &str) -> Result<()> {
         Ok(())
     }
 

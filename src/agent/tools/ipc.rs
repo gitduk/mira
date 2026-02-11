@@ -90,7 +90,7 @@ impl Tool for ScheduleTaskTool {
                 },
                 "schedule_value": {
                     "type": "string",
-                    "description": "cron expression, milliseconds, or ISO timestamp"
+                    "description": "For cron: a 7-field cron expression (sec min hour day_of_month month day_of_week year), e.g. '0 30 9 * * * *' for daily at 09:30. For interval: milliseconds. For once: ISO 8601 timestamp."
                 },
                 "context_mode": {
                     "type": "string",
@@ -138,7 +138,7 @@ impl Tool for ScheduleTaskTool {
                 schedule_value: schedule_value.to_string(),
                 context_mode: context_mode.to_string(),
                 target_addr: ChannelAddr::new(target_module, target_channel),
-                source_group: ctx.group_folder.clone(),
+                source_workspace: ctx.workspace.clone(),
             })
             .await
             .map_err(|e| crate::error::MiraError::Tool(format!("Failed to send IPC: {}", e)))?;
@@ -174,7 +174,7 @@ impl Tool for ListTasksTool {
         let tasks = if ctx.is_main {
             ctx.db.get_all_tasks()?
         } else {
-            ctx.db.get_tasks_for_group(&ctx.group_folder)?
+            ctx.db.get_tasks_for_workspace(&ctx.workspace)?
         };
 
         if tasks.is_empty() {
@@ -187,10 +187,9 @@ impl Tool for ListTasksTool {
                 format!(
                     "- [{}] {}... ({}: {}) - {}, next: {}",
                     t.id,
-                    if t.prompt.len() > 50 {
-                        &t.prompt[..50]
-                    } else {
-                        &t.prompt
+                    {
+                        let s: String = t.prompt.chars().take(50).collect();
+                        s
                     },
                     t.schedule_type.as_str(),
                     t.schedule_value,
@@ -242,7 +241,7 @@ impl Tool for PauseTaskTool {
         ctx.ipc_sender
             .send(IpcCommand::PauseTask {
                 task_id: task_id.to_string(),
-                source_group: ctx.group_folder.clone(),
+                source_workspace: ctx.workspace.clone(),
             })
             .await
             .map_err(|e| crate::error::MiraError::Tool(format!("Failed to send IPC: {}", e)))?;
@@ -286,7 +285,7 @@ impl Tool for ResumeTaskTool {
         ctx.ipc_sender
             .send(IpcCommand::ResumeTask {
                 task_id: task_id.to_string(),
-                source_group: ctx.group_folder.clone(),
+                source_workspace: ctx.workspace.clone(),
             })
             .await
             .map_err(|e| crate::error::MiraError::Tool(format!("Failed to send IPC: {}", e)))?;
@@ -333,7 +332,7 @@ impl Tool for CancelTaskTool {
         ctx.ipc_sender
             .send(IpcCommand::CancelTask {
                 task_id: task_id.to_string(),
-                source_group: ctx.group_folder.clone(),
+                source_workspace: ctx.workspace.clone(),
             })
             .await
             .map_err(|e| crate::error::MiraError::Tool(format!("Failed to send IPC: {}", e)))?;

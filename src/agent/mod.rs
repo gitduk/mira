@@ -45,7 +45,7 @@ pub enum AgentStatus {
 pub struct AgentInput {
     pub prompt: String,
     pub session_id: Option<String>,
-    pub group_folder: String,
+    pub workspace: String,
     pub addr: ChannelAddr,
     pub is_main: bool,
     pub is_scheduled_task: bool,
@@ -77,7 +77,7 @@ pub async fn run_agent(
     // Build tool context
     let tool_ctx = tools::ToolContext {
         workspace_dir: input.workspace_dir.clone(),
-        group_folder: input.group_folder.clone(),
+        workspace: input.workspace.clone(),
         addr: input.addr.clone(),
         is_main: input.is_main,
         ipc_sender: ipc_tx,

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::{Tool, ToolContext, ToolResult};
 
@@ -107,7 +107,7 @@ impl Tool for EditTool {
     }
 }
 
-fn resolve_path(file_path: &str, workspace_dir: &PathBuf) -> PathBuf {
+fn resolve_path(file_path: &str, workspace_dir: &Path) -> PathBuf {
     let path = PathBuf::from(file_path);
     if path.is_absolute() {
         path

@@ -28,7 +28,7 @@ impl NewMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduledTask {
     pub id: String,
-    pub group_folder: String,
+    pub workspace: String,
     pub chat_jid: String,
     pub prompt: String,
     pub schedule_type: ScheduleType,
@@ -189,18 +189,18 @@ pub enum IpcCommand {
         schedule_value: String,
         context_mode: String,
         target_addr: ChannelAddr,
-        source_group: String,
+        source_workspace: String,
     },
     PauseTask {
         task_id: String,
-        source_group: String,
+        source_workspace: String,
     },
     ResumeTask {
         task_id: String,
-        source_group: String,
+        source_workspace: String,
     },
     CancelTask {
         task_id: String,
-        source_group: String,
+        source_workspace: String,
     },
 }

@@ -5,6 +5,7 @@ pub struct DashboardState {
     pub max_agents: usize,
     pub modules: Vec<Module>,
     pub active_agents: usize,
+    pub active_tasks: usize,
     pub message_count: usize,
     pub start_time: std::time::Instant,
     pub thinking_buffer: Vec<String>,
@@ -12,11 +13,14 @@ pub struct DashboardState {
     pub streaming_line: Option<String>,
     pub input_buffer: String,
     pub cursor_pos: usize,
-    pub input_mode: bool,
+    pub input_enabled: bool,
     pub api_base_url: String,
     pub claude_model: String,
     pub max_thinking_lines: usize,
     pub scroll_offset: usize,
+    pub input_history: Vec<String>,
+    pub history_index: Option<usize>,
+    pub saved_input: String,
 }
 
 impl DashboardState {
@@ -32,6 +36,7 @@ impl DashboardState {
             max_agents,
             modules: Vec::new(),
             active_agents: 0,
+            active_tasks: 0,
             message_count: 0,
             start_time: std::time::Instant::now(),
             thinking_buffer: Vec::new(),
@@ -39,11 +44,14 @@ impl DashboardState {
             streaming_line: None,
             input_buffer: String::new(),
             cursor_pos: 0,
-            input_mode: false,
+            input_enabled: false,
             api_base_url,
             claude_model,
             max_thinking_lines,
             scroll_offset: 0,
+            input_history: Vec::new(),
+            history_index: None,
+            saved_input: String::new(),
         }
     }
 

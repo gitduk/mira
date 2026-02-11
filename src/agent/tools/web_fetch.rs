@@ -52,7 +52,7 @@ impl Tool for WebFetchTool {
             .timeout(std::time::Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::limited(5))
             .build()
-            .map_err(|e| crate::error::MiraError::Http(e))?;
+            .map_err(crate::error::MiraError::Http)?;
 
         match client
             .get(&url)

@@ -122,25 +122,21 @@ impl Tool for GrepTool {
                     result.push_str(&format!("{}\n", file.display()));
                 }
                 "count" => {
-                    result.push_str(&format!(
-                        "{}:{}\n",
-                        file.display(),
-                        file_matches.len()
-                    ));
+                    result.push_str(&format!("{}:{}\n", file.display(), file_matches.len()));
                 }
-                "content" | _ => {
+                _ => {
                     for &line_idx in &file_matches {
                         let start = line_idx.saturating_sub(context_lines);
                         let end = (line_idx + context_lines + 1).min(lines.len());
 
-                        for j in start..end {
+                        for (j, line) in lines.iter().enumerate().take(end).skip(start) {
                             let prefix = if j == line_idx { ">" } else { " " };
                             result.push_str(&format!(
                                 "{}:{}:{} {}\n",
                                 file.display(),
                                 j + 1,
                                 prefix,
-                                lines[j]
+                                line
                             ));
                         }
                         if context_lines > 0 {

@@ -4,7 +4,7 @@ use crate::comm::ChannelAddr;
 
 pub struct ModuleWorkItem {
     pub prompt: String,
-    pub group_folder: String,
+    pub workspace: String,
     pub addr: ChannelAddr,
     pub is_main: bool,
     pub is_scheduled_task: bool,

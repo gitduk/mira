@@ -2,9 +2,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use super::api::{
-    AnthropicClient, ContentBlock, Delta, Message, MessagesRequest, StreamEvent,
-};
+use super::api::{AnthropicClient, ContentBlock, Delta, Message, MessagesRequest, StreamEvent};
 use super::session::Session;
 use super::tools::{ToolContext, ToolRegistry, ToolResult};
 use super::{AgentResponse, OnProgressCallback, OutputType};
@@ -31,6 +29,7 @@ pub struct LoopResult {
     pub response: AgentResponse,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn agentic_loop(
     api_base_url: &str,
     api_key: &str,
@@ -206,7 +205,8 @@ pub async fn agentic_loop(
                             Ok(ToolResult { content, is_error }) => {
                                 if let Some(ref cb) = on_progress {
                                     let summary = if content.len() > 200 {
-                                        format!("{}...", &content[..200])
+                                        let end = content.floor_char_boundary(200);
+                                        format!("{}...", &content[..end])
                                     } else {
                                         content.clone()
                                     };
@@ -261,7 +261,8 @@ pub async fn agentic_loop(
 }
 
 fn format_tool_summary(tool_name: &str, input_json: &str) -> String {
-    let input: Value = serde_json::from_str(input_json).unwrap_or(Value::Object(Default::default()));
+    let input: Value =
+        serde_json::from_str(input_json).unwrap_or(Value::Object(Default::default()));
 
     match tool_name {
         "Read" => {

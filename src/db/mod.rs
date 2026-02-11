@@ -29,11 +29,22 @@ impl Database {
 
     fn init_schema(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+
+        // Migration: rename group_folder -> workspace (must run before CREATE TABLE IF NOT EXISTS)
+        let has_old_column: bool = conn
+            .prepare("SELECT group_folder FROM scheduled_tasks LIMIT 0")
+            .is_ok();
+        if has_old_column {
+            conn.execute_batch(
+                "ALTER TABLE scheduled_tasks RENAME COLUMN group_folder TO workspace;",
+            )?;
+        }
+
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS scheduled_tasks (
                 id TEXT PRIMARY KEY,
-                group_folder TEXT NOT NULL,
+                workspace TEXT NOT NULL,
                 chat_jid TEXT NOT NULL,
                 prompt TEXT NOT NULL,
                 schedule_type TEXT NOT NULL,
@@ -63,6 +74,7 @@ impl Database {
 
             ",
         )?;
+
         Ok(())
     }
 

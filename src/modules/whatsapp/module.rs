@@ -133,7 +133,7 @@ impl CommunicationModule for WhatsAppModule {
                         let module_status = match status.as_str() {
                             "open" => ModuleStatus::Connected,
                             "close" => {
-                                if reason.map_or(true, |r| r != 401 && r != 440) {
+                                if reason.is_none_or(|r| r != 401 && r != 440) {
                                     ModuleStatus::Reconnecting
                                 } else {
                                     ModuleStatus::Disconnected
@@ -248,10 +248,10 @@ impl CommunicationModule for WhatsAppModule {
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "source_group": { "type": "string" },
+                        "source_workspace": { "type": "string" },
                         "target_jid": { "type": "string" }
                     },
-                    "required": ["source_group", "target_jid"]
+                    "required": ["source_workspace", "target_jid"]
                 }),
             },
         ]
@@ -305,26 +305,36 @@ impl CommunicationModule for WhatsAppModule {
                 })
             }
             "authorize_schedule_task" => {
-                let source_group = call.input["source_group"].as_str().unwrap_or_default();
+                let source_workspace = call.input["source_workspace"].as_str().unwrap_or_default();
                 let target_jid = call.input["target_jid"].as_str().unwrap_or_default();
 
-                if source_group.is_empty() || target_jid.is_empty() {
+                if source_workspace.is_empty() || target_jid.is_empty() {
                     return Ok(ModuleToolResult {
-                        content: "source_group and target_jid are required".into(),
+                        content: "source_workspace and target_jid are required".into(),
                         is_error: true,
                     });
                 }
 
-                if self.config.is_main_group(source_group) {
+                // Main workspace can schedule anywhere
+                if self.config.is_main_workspace(source_workspace) {
                     return Ok(ModuleToolResult {
                         content: "authorized".into(),
                         is_error: false,
                     });
                 }
 
+                // Private chats (dm) can schedule tasks targeting themselves
+                if source_workspace == "dm" {
+                    return Ok(ModuleToolResult {
+                        content: "authorized".into(),
+                        is_error: false,
+                    });
+                }
+
+                // Registered groups can schedule tasks targeting their own JID
                 let groups = self.store.get_registered_groups().unwrap_or_default();
                 if let Some(group) = groups.get(target_jid) {
-                    if group.folder == source_group {
+                    if group.folder == source_workspace {
                         return Ok(ModuleToolResult {
                             content: "authorized".into(),
                             is_error: false,
@@ -390,13 +400,13 @@ impl CommunicationModule for WhatsAppModule {
             }
             prompt.push_str("</messages>");
 
-            let group_folder = group.folder.clone();
-            let workspace_dir = self.config.groups_dir.join(&group_folder);
-            let is_main = self.config.is_main_group(&group_folder);
+            let workspace = group.folder.clone();
+            let workspace_dir = self.config.groups_dir.join(&workspace);
+            let is_main = self.config.is_main_workspace(&workspace);
 
             work_items.push(ModuleWorkItem {
                 prompt,
-                group_folder,
+                workspace,
                 addr: ChannelAddr::new(MODULE_ID, jid),
                 is_main,
                 is_scheduled_task: false,
@@ -444,12 +454,12 @@ impl CommunicationModule for WhatsAppModule {
             }
             prompt.push_str("</messages>");
 
-            let group_folder = "dm".to_string();
-            let workspace_dir = self.config.groups_dir.join(&group_folder);
+            let workspace = "dm".to_string();
+            let workspace_dir = self.config.groups_dir.join(&workspace);
 
             work_items.push(ModuleWorkItem {
                 prompt,
-                group_folder,
+                workspace,
                 addr: ChannelAddr::new(MODULE_ID, &jid),
                 is_main: false,
                 is_scheduled_task: false,
@@ -468,11 +478,11 @@ impl CommunicationModule for WhatsAppModule {
         self.bridge_cmd_sender = None;
     }
 
-    async fn get_session_id(&self, group_folder: &str) -> Result<Option<String>> {
-        self.store.get_session(group_folder)
+    async fn get_session_id(&self, workspace: &str) -> Result<Option<String>> {
+        self.store.get_session(workspace)
     }
 
-    async fn set_session_id(&self, group_folder: &str, session_id: &str) -> Result<()> {
-        self.store.set_session(group_folder, session_id)
+    async fn set_session_id(&self, workspace: &str, session_id: &str) -> Result<()> {
+        self.store.set_session(workspace, session_id)
     }
 }

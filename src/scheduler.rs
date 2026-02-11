@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use cron::Schedule;
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
@@ -11,14 +12,20 @@ use crate::types::{RunStatus, ScheduleType, ScheduledTask, TaskRunLog, TaskStatu
 pub struct Scheduler {
     db: Arc<Database>,
     config: Arc<Config>,
+    task_tx: mpsc::Sender<ScheduledTask>,
     running: bool,
 }
 
 impl Scheduler {
-    pub fn new(db: Arc<Database>, config: Arc<Config>) -> Self {
+    pub fn new(
+        db: Arc<Database>,
+        config: Arc<Config>,
+        task_tx: mpsc::Sender<ScheduledTask>,
+    ) -> Self {
         Scheduler {
             db,
             config,
+            task_tx,
             running: false,
         }
     }
@@ -69,55 +76,80 @@ impl Scheduler {
                 continue;
             }
 
-            // Run the task (in the future, this would go through the ModuleQueue)
             self.execute_task(&current).await;
         }
     }
 
     async fn execute_task(&self, task: &ScheduledTask) {
-        let start = std::time::Instant::now();
-        info!(task_id = %task.id, group = %task.group_folder, "Running scheduled task");
-
-        // For now, we just log that the task should run
-        // The actual agent execution will be handled by the main loop
-        let duration_ms = start.elapsed().as_millis() as i64;
+        info!(task_id = %task.id, workspace = %task.workspace, "Dispatching scheduled task");
 
         // Calculate next run
         let next_run = calculate_next_run(task);
 
-        let result_summary = "Task execution delegated to agent loop";
+        // Update next_run in DB before dispatching
         if let Err(e) = self
             .db
-            .update_task_after_run(&task.id, next_run.as_deref(), result_summary)
+            .update_task_after_run(&task.id, next_run.as_deref(), "dispatched")
         {
             error!(task_id = %task.id, "Failed to update task after run: {}", e);
+            return;
         }
 
         if let Err(e) = self.db.log_task_run(&TaskRunLog {
             task_id: task.id.clone(),
             run_at: Utc::now().to_rfc3339(),
-            duration_ms,
+            duration_ms: 0,
             status: RunStatus::Success,
-            result: Some(result_summary.to_string()),
+            result: Some("dispatched to agent".into()),
             error: None,
         }) {
             error!(task_id = %task.id, "Failed to log task run: {}", e);
         }
+
+        // Send to main loop for actual agent execution
+        if let Err(e) = self.task_tx.send(task.clone()).await {
+            error!(task_id = %task.id, "Failed to send task to main loop: {}", e);
+        }
     }
 }
 
-pub fn calculate_next_run(task: &ScheduledTask) -> Option<String> {
+/// Calculate initial next_run when a task is first created.
+pub fn calculate_initial_next_run(task: &ScheduledTask) -> Option<String> {
     match task.schedule_type {
-        ScheduleType::Cron => {
-            // Parse cron expression and get next occurrence
-            match task.schedule_value.parse::<Schedule>() {
-                Ok(schedule) => schedule.upcoming(Utc).next().map(|t| t.to_rfc3339()),
-                Err(e) => {
-                    warn!(task_id = %task.id, "Invalid cron expression: {}", e);
-                    None
-                }
+        ScheduleType::Cron => match task.schedule_value.parse::<Schedule>() {
+            Ok(schedule) => schedule.upcoming(Utc).next().map(|t| t.to_rfc3339()),
+            Err(e) => {
+                warn!(task_id = %task.id, "Invalid cron expression: {}", e);
+                None
+            }
+        },
+        ScheduleType::Interval => {
+            let ms: u64 = task.schedule_value.parse().unwrap_or(0);
+            if ms > 0 {
+                let next = Utc::now() + chrono::Duration::milliseconds(ms as i64);
+                Some(next.to_rfc3339())
+            } else {
+                None
             }
         }
+        ScheduleType::Once => {
+            // schedule_value is an ISO timestamp — use it directly as next_run
+            Some(task.schedule_value.clone())
+        }
+    }
+}
+
+/// Calculate next_run after a task has been executed.
+/// Returns None for one-time tasks (marks them as completed).
+pub fn calculate_next_run(task: &ScheduledTask) -> Option<String> {
+    match task.schedule_type {
+        ScheduleType::Cron => match task.schedule_value.parse::<Schedule>() {
+            Ok(schedule) => schedule.upcoming(Utc).next().map(|t| t.to_rfc3339()),
+            Err(e) => {
+                warn!(task_id = %task.id, "Invalid cron expression: {}", e);
+                None
+            }
+        },
         ScheduleType::Interval => {
             let ms: u64 = task.schedule_value.parse().unwrap_or(0);
             if ms > 0 {

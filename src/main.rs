@@ -90,6 +90,14 @@ async fn main() {
 
     // ModuleQueue
     let module_queue = Arc::new(ModuleQueue::new(config.max_concurrent_agents));
+    {
+        let dash_tx = dash_tx.clone();
+        module_queue
+            .set_on_state_change(Box::new(move |active_agents, _active_tasks| {
+                let _ = dash_tx.try_send(DashboardCommand::SetActiveAgents(active_agents));
+            }))
+            .await;
+    }
 
     // Start dashboard (if enabled)
     let _dashboard_handle = if config.dashboard_enabled {
@@ -119,6 +127,9 @@ async fn main() {
 
     // Enable input by default
     let _ = dash_tx.send(DashboardCommand::EnableInputMode).await;
+    if let Ok(count) = db.get_active_task_count() {
+        let _ = dash_tx.send(DashboardCommand::SetActiveTasks(count)).await;
+    }
 
     // --- Module registry ---
     let modules: Arc<tokio::sync::Mutex<HashMap<String, Box<dyn CommunicationModule>>>> =
@@ -184,6 +195,13 @@ async fn main() {
     let core_pending: Arc<tokio::sync::Mutex<VecDeque<MiraMessage>>> =
         Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
 
+    // Pending scheduled tasks queue: module_id -> Vec<ScheduledTask>
+    let scheduled_pending: Arc<tokio::sync::Mutex<HashMap<String, Vec<types::ScheduledTask>>>> =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+    // Channel for scheduler to send due tasks to main loop
+    let (sched_task_tx, mut sched_task_rx) = mpsc::channel::<types::ScheduledTask>(64);
+
     {
         let core_pending = core_pending.clone();
         let dash_tx = dash_tx.clone();
@@ -226,6 +244,7 @@ async fn main() {
         let process_modules = modules.clone();
         let process_dash_tx = dash_tx.clone();
         let core_pending = core_pending.clone();
+        let scheduled_pending = scheduled_pending.clone();
 
         module_queue
             .set_process_fn(Arc::new(move |module_id: String| {
@@ -235,6 +254,7 @@ async fn main() {
                 let modules = process_modules.clone();
                 let dash_tx = process_dash_tx.clone();
                 let core_pending = core_pending.clone();
+                let scheduled_pending = scheduled_pending.clone();
 
                 Box::pin(async move {
                     if module_id == "core" {
@@ -267,7 +287,7 @@ async fn main() {
                         let agent_input = agent::AgentInput {
                             prompt,
                             session_id: None,
-                            group_folder: "terminal".to_string(),
+                            workspace: "terminal".to_string(),
                             addr: ChannelAddr::new("terminal", "terminal"),
                             is_main: true,
                             is_scheduled_task: false,
@@ -344,7 +364,111 @@ async fn main() {
                         return true;
                     }
 
-                    let work_items = {
+                    // Terminal scheduled tasks — "terminal" is not a CommunicationModule,
+                    // so handle it separately before the module branch.
+                    if module_id == "terminal" {
+                        let tasks = {
+                            let mut sched = scheduled_pending.lock().await;
+                            sched.remove("terminal").unwrap_or_default()
+                        };
+                        if tasks.is_empty() {
+                            return true;
+                        }
+
+                        for task in tasks {
+                            info!(task_id = %task.id, "Executing terminal scheduled task");
+
+                            let tools_info = {
+                                let mut modules_lock = modules.lock().await;
+                                let mut tools_by_module = Vec::new();
+                                for (mid, module) in modules_lock.iter_mut() {
+                                    tools_by_module.push((mid.clone(), module.tools()));
+                                }
+                                format_all_module_tools(tools_by_module)
+                            };
+                            let prompt = format!("{}\n{}", tools_info, task.prompt);
+
+                            let agent_input = agent::AgentInput {
+                                prompt,
+                                session_id: None,
+                                workspace: "terminal".to_string(),
+                                addr: task.addr(),
+                                is_main: true,
+                                is_scheduled_task: true,
+                                persist_session: false,
+                                workspace_dir: config.store_dir.clone(),
+                                global_claude_md: None,
+                            };
+
+                            let dash_tx_clone = dash_tx.clone();
+                            let on_progress: Option<agent::OnProgressCallback> =
+                                Some(Box::new(move |event| match event.event_type {
+                                    agent::ProgressEventType::TextStreaming => {
+                                        let _ = dash_tx_clone
+                                            .try_send(DashboardCommand::SetThinkingIndicator(None));
+                                        let _ = dash_tx_clone.try_send(
+                                            DashboardCommand::SetStreamingLine(Some(event.text)),
+                                        );
+                                    }
+                                    agent::ProgressEventType::Text => {
+                                        let _ = dash_tx_clone
+                                            .try_send(DashboardCommand::SetThinkingIndicator(None));
+                                        let _ = dash_tx_clone
+                                            .try_send(DashboardCommand::SetStreamingLine(None));
+                                        let _ = dash_tx_clone
+                                            .try_send(DashboardCommand::PushThinkingLine(event.text));
+                                    }
+                                    agent::ProgressEventType::ToolUse => {
+                                        let _ = dash_tx_clone
+                                            .try_send(DashboardCommand::SetStreamingLine(None));
+                                        let _ = dash_tx_clone.try_send(
+                                            DashboardCommand::SetThinkingIndicator(Some(event.text)),
+                                        );
+                                    }
+                                    agent::ProgressEventType::ToolSummary => {
+                                        let _ = dash_tx_clone
+                                            .try_send(DashboardCommand::PushThinkingLine(event.text));
+                                    }
+                                }));
+
+                            let _ = dash_tx
+                                .send(DashboardCommand::SetThinkingIndicator(Some(
+                                    "Thinking...".into(),
+                                )))
+                                .await;
+
+                            let output = agent::run_agent(
+                                agent_input,
+                                &config,
+                                db.clone(),
+                                ipc_tx.clone(),
+                                on_progress,
+                            )
+                            .await;
+
+                            let _ = dash_tx
+                                .send(DashboardCommand::SetThinkingIndicator(None))
+                                .await;
+
+                            if output.status == agent::AgentStatus::Error {
+                                error!(
+                                    task_id = %task.id,
+                                    error = ?output.error,
+                                    "Terminal scheduled task failed"
+                                );
+                                let _ = dash_tx
+                                    .send(DashboardCommand::PushThinkingLine(format!(
+                                        "Scheduled task error: {}",
+                                        output.error.unwrap_or_default()
+                                    )))
+                                    .await;
+                            }
+                        }
+
+                        return true;
+                    }
+
+                    let mut work_items = {
                         let mut modules_lock = modules.lock().await;
                         let Some(module) = modules_lock.get_mut(&module_id) else {
                             warn!(module_id, "No module registered for dispatch");
@@ -359,6 +483,27 @@ async fn main() {
                         }
                     };
 
+                    // Drain pending scheduled tasks for this module
+                    {
+                        let mut sched = scheduled_pending.lock().await;
+                        if let Some(tasks) = sched.remove(&module_id) {
+                            for task in tasks {
+                                let workspace = task.workspace.clone();
+                                let workspace_dir = config.groups_dir.join(&workspace);
+                                let is_main = config.is_main_workspace(&workspace);
+                                work_items.push(dispatch::ModuleWorkItem {
+                                    prompt: task.prompt.clone(),
+                                    workspace,
+                                    addr: task.addr(),
+                                    is_main,
+                                    is_scheduled_task: true,
+                                    workspace_dir,
+                                    global_claude_md: None,
+                                });
+                            }
+                        }
+                    }
+
                     if work_items.is_empty() {
                         return true;
                     }
@@ -368,7 +513,7 @@ async fn main() {
                             let mut modules_lock = modules.lock().await;
                             if let Some(module) = modules_lock.get_mut(&module_id) {
                                 let sid = module
-                                    .get_session_id(&item.group_folder)
+                                    .get_session_id(&item.workspace)
                                     .await
                                     .ok()
                                     .flatten();
@@ -391,7 +536,7 @@ async fn main() {
                         let agent_input = agent::AgentInput {
                             prompt,
                             session_id,
-                            group_folder: item.group_folder.clone(),
+                            workspace: item.workspace.clone(),
                             addr: item.addr.clone(),
                             is_main: item.is_main,
                             is_scheduled_task: item.is_scheduled_task,
@@ -459,19 +604,6 @@ async fn main() {
                         )
                         .await;
 
-                        // Clear typing indicator
-                        {
-                            let modules_lock = modules.lock().await;
-                            if let Some(module) = modules_lock.get(&module_id) {
-                                let _ = module
-                                    .send_command(ModuleCommand::SendPresence {
-                                        channel_id: item.addr.channel_id.clone(),
-                                        presence: "paused".into(),
-                                    })
-                                    .await;
-                            }
-                        }
-
                         let _ = dash_tx
                             .send(DashboardCommand::SetThinkingIndicator(None))
                             .await;
@@ -479,7 +611,7 @@ async fn main() {
                         if let Some(sid) = output.new_session_id {
                             let mut modules_lock = modules.lock().await;
                             if let Some(module) = modules_lock.get_mut(&module_id) {
-                                let _ = module.set_session_id(&item.group_folder, &sid).await;
+                                let _ = module.set_session_id(&item.workspace, &sid).await;
                             }
                         }
 
@@ -495,6 +627,19 @@ async fn main() {
                                     output.error.unwrap_or_default()
                                 )))
                                 .await;
+
+                            // Clear typing indicator on error
+                            {
+                                let modules_lock = modules.lock().await;
+                                if let Some(module) = modules_lock.get(&module_id) {
+                                    let _ = module
+                                        .send_command(ModuleCommand::SendPresence {
+                                            channel_id: item.addr.channel_id.clone(),
+                                            presence: "paused".into(),
+                                        })
+                                        .await;
+                                }
+                            }
                             return false;
                         }
 
@@ -502,13 +647,31 @@ async fn main() {
                         if let Some(ref resp) = output.result {
                             if let Some(ref text) = resp.user_message {
                                 if !text.trim().is_empty() {
-                                    let _ = ipc_tx
-                                        .send(IpcCommand::SendMessage {
-                                            addr: item.addr.clone(),
-                                            text: text.clone(),
-                                        })
-                                        .await;
+                                    let modules_lock = modules.lock().await;
+                                    if let Some(module) = modules_lock.get(&module_id) {
+                                        // Send message directly via module (not IPC) so we
+                                        // can clear typing indicator after it completes.
+                                        let _ = module
+                                            .send_command(ModuleCommand::SendMessage {
+                                                channel_id: item.addr.channel_id.clone(),
+                                                text: text.clone(),
+                                            })
+                                            .await;
+                                    }
                                 }
+                            }
+                        }
+
+                        // Clear typing indicator after message is sent
+                        {
+                            let modules_lock = modules.lock().await;
+                            if let Some(module) = modules_lock.get(&module_id) {
+                                let _ = module
+                                    .send_command(ModuleCommand::SendPresence {
+                                        channel_id: item.addr.channel_id.clone(),
+                                        presence: "paused".into(),
+                                    })
+                                    .await;
                             }
                         }
                     }
@@ -524,7 +687,7 @@ async fn main() {
     let scheduler_config = config.clone();
     let scheduler_shutdown_rx = shutdown_rx.clone();
     let scheduler_handle = tokio::spawn(async move {
-        let mut scheduler = Scheduler::new(scheduler_db, scheduler_config);
+        let mut scheduler = Scheduler::new(scheduler_db, scheduler_config, sched_task_tx);
         scheduler.run_loop(scheduler_shutdown_rx).await;
     });
 
@@ -578,6 +741,22 @@ async fn main() {
                     cmd, &config, &db,
                     &dash_tx, &modules,
                 ).await;
+            }
+
+            // Scheduled tasks from scheduler
+            Some(task) = sched_task_rx.recv() => {
+                let module_id = task.module_id.clone();
+                info!(task_id = %task.id, module_id, "Received scheduled task from scheduler");
+                {
+                    let mut sched = scheduled_pending.lock().await;
+                    sched.entry(module_id.clone()).or_default().push(task);
+                }
+                if let Ok(count) = db.get_active_task_count() {
+                    let _ = dash_tx
+                        .send(DashboardCommand::SetActiveTasks(count))
+                        .await;
+                }
+                module_queue.enqueue_module(module_id).await;
             }
 
             // Shutdown
@@ -677,7 +856,7 @@ async fn handle_ipc_command(
             schedule_value,
             context_mode,
             target_addr,
-            source_group,
+            source_workspace,
         } => {
             if let Some(module) = modules.lock().await.get_mut(&target_addr.module_id) {
                 let has_auth_tool = module
@@ -689,7 +868,7 @@ async fn handle_ipc_command(
                         .call_tool(crate::comm::ModuleToolCall {
                             name: "authorize_schedule_task".into(),
                             input: serde_json::json!({
-                                "source_group": source_group,
+                                "source_workspace": source_workspace,
                                 "target_jid": target_addr.channel_id
                             }),
                         })
@@ -704,18 +883,13 @@ async fn handle_ipc_command(
                 }
             }
 
-            let is_main = config.is_main_group(&source_group);
             let task_id = format!(
                 "task-{}-{}",
                 chrono::Utc::now().timestamp_millis(),
                 &uuid::Uuid::new_v4().to_string()[..6]
             );
             let now = chrono::Utc::now().to_rfc3339();
-            let target_folder = if is_main {
-                source_group.clone()
-            } else {
-                source_group.clone()
-            };
+            let target_workspace = source_workspace.clone();
 
             let stype =
                 types::ScheduleType::from_str(&schedule_type).unwrap_or(types::ScheduleType::Once);
@@ -723,7 +897,7 @@ async fn handle_ipc_command(
 
             let task = types::ScheduledTask {
                 id: task_id.clone(),
-                group_folder: target_folder,
+                workspace: target_workspace,
                 chat_jid: target_addr.channel_id.clone(),
                 prompt,
                 schedule_type: stype,
@@ -737,7 +911,7 @@ async fn handle_ipc_command(
                 module_id: target_addr.module_id,
             };
 
-            let next_run = scheduler::calculate_next_run(&task);
+            let next_run = scheduler::calculate_initial_next_run(&task);
             let mut task = task;
             task.next_run = next_run;
 
@@ -745,41 +919,53 @@ async fn handle_ipc_command(
                 error!(%task_id, "Failed to create task: {}", e);
             } else {
                 info!(%task_id, "Task created via IPC");
+                if let Ok(count) = db.get_active_task_count() {
+                    let _ = dash_tx.send(DashboardCommand::SetActiveTasks(count)).await;
+                }
             }
         }
         IpcCommand::PauseTask {
             task_id,
-            source_group,
+            source_workspace,
         } => {
-            let is_main = config.is_main_group(&source_group);
+            let is_main = config.is_main_workspace(&source_workspace);
             if let Ok(Some(task)) = db.get_task_by_id(&task_id) {
-                if is_main || task.group_folder == source_group {
+                if is_main || task.workspace == source_workspace {
                     let _ = db.update_task_status(&task_id, &types::TaskStatus::Paused);
                     info!(%task_id, "Task paused via IPC");
+                    if let Ok(count) = db.get_active_task_count() {
+                        let _ = dash_tx.send(DashboardCommand::SetActiveTasks(count)).await;
+                    }
                 }
             }
         }
         IpcCommand::ResumeTask {
             task_id,
-            source_group,
+            source_workspace,
         } => {
-            let is_main = config.is_main_group(&source_group);
+            let is_main = config.is_main_workspace(&source_workspace);
             if let Ok(Some(task)) = db.get_task_by_id(&task_id) {
-                if is_main || task.group_folder == source_group {
+                if is_main || task.workspace == source_workspace {
                     let _ = db.update_task_status(&task_id, &types::TaskStatus::Active);
                     info!(%task_id, "Task resumed via IPC");
+                    if let Ok(count) = db.get_active_task_count() {
+                        let _ = dash_tx.send(DashboardCommand::SetActiveTasks(count)).await;
+                    }
                 }
             }
         }
         IpcCommand::CancelTask {
             task_id,
-            source_group,
+            source_workspace,
         } => {
-            let is_main = config.is_main_group(&source_group);
+            let is_main = config.is_main_workspace(&source_workspace);
             if let Ok(Some(task)) = db.get_task_by_id(&task_id) {
-                if is_main || task.group_folder == source_group {
+                if is_main || task.workspace == source_workspace {
                     let _ = db.delete_task(&task_id);
                     info!(%task_id, "Task cancelled via IPC");
+                    if let Ok(count) = db.get_active_task_count() {
+                        let _ = dash_tx.send(DashboardCommand::SetActiveTasks(count)).await;
+                    }
                 }
             }
         }

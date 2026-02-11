@@ -127,9 +127,13 @@ pub fn build_system_prompt(
     workspace_dir: &Path,
     global_claude_md: Option<&str>,
 ) -> String {
+    let now_utc = chrono::Utc::now();
     let mut prompt = format!(
-        "You are {}, a helpful AI assistant. You have access to various tools to help accomplish tasks.\n\n",
-        config.assistant_name
+        "You are {}, a helpful AI assistant. You have access to various tools to help accomplish tasks.\n\n\
+         Current time (UTC): {}\nTimezone: {}\n\n",
+        config.assistant_name,
+        now_utc.to_rfc3339(),
+        config.timezone,
     );
 
     // Load group CLAUDE.md

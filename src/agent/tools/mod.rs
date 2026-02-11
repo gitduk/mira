@@ -22,7 +22,7 @@ use crate::types::IpcCommand;
 
 pub struct ToolContext {
     pub workspace_dir: PathBuf,
-    pub group_folder: String,
+    pub workspace: String,
     pub addr: ChannelAddr,
     pub is_main: bool,
     pub ipc_sender: mpsc::Sender<IpcCommand>,

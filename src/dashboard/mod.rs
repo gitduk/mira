@@ -5,7 +5,10 @@ pub mod ui;
 use std::io;
 use std::time::Duration;
 
-use crossterm::event::{self, Event};
+use crossterm::event::{
+    self, Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -25,6 +28,7 @@ pub enum DashboardCommand {
     SetModuleStatus(String, ModuleStatus),
     SetModuleMounted(String, bool),
     SetActiveAgents(usize),
+    SetActiveTasks(usize),
     IncrementMessages(usize),
     PushThinkingLine(String),
     SetThinkingIndicator(Option<String>),
@@ -41,6 +45,7 @@ pub struct Dashboard {
 }
 
 impl Dashboard {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         agent_name: String,
         max_agents: usize,
@@ -70,6 +75,10 @@ impl Dashboard {
         // Setup terminal
         enable_raw_mode()?;
         io::stdout().execute(EnterAlternateScreen)?;
+        // Try to enable key disambiguation so Shift+Enter can be distinguished from Enter.
+        let _ = io::stdout().execute(PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+        ));
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = Terminal::new(backend)?;
         terminal.clear()?;
@@ -95,6 +104,11 @@ impl Dashboard {
             // Handle input events
             if event::poll(tick_rate)? {
                 if let Event::Key(key_event) = event::read()? {
+                    if key_event.kind != KeyEventKind::Press
+                        && key_event.kind != KeyEventKind::Repeat
+                    {
+                        continue;
+                    }
                     match input::handle_key_event(key_event, &mut self.state) {
                         InputAction::Quit => break,
                         InputAction::Submit(text) => {
@@ -102,7 +116,7 @@ impl Dashboard {
                                 let _ = tx.try_send(text);
                             }
                         }
-                        InputAction::ToggleInput | InputAction::None => {}
+                        InputAction::None => {}
                     }
                 }
             }
@@ -114,6 +128,7 @@ impl Dashboard {
         }
 
         // Restore terminal
+        let _ = io::stdout().execute(PopKeyboardEnhancementFlags);
         disable_raw_mode()?;
         io::stdout().execute(LeaveAlternateScreen)?;
 
@@ -138,6 +153,9 @@ impl Dashboard {
             DashboardCommand::SetActiveAgents(count) => {
                 self.state.active_agents = count;
             }
+            DashboardCommand::SetActiveTasks(count) => {
+                self.state.active_tasks = count;
+            }
             DashboardCommand::IncrementMessages(count) => {
                 self.state.message_count += count;
             }
@@ -151,7 +169,7 @@ impl Dashboard {
                 self.state.streaming_line = line;
             }
             DashboardCommand::EnableInputMode => {
-                self.state.input_mode = true;
+                self.state.input_enabled = true;
             }
         }
     }

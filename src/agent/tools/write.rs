@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::{Tool, ToolContext, ToolResult};
 
@@ -34,12 +34,8 @@ impl Tool for WriteTool {
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext) -> crate::error::Result<ToolResult> {
-        let file_path = input["file_path"]
-            .as_str()
-            .unwrap_or_default();
-        let content = input["content"]
-            .as_str()
-            .unwrap_or_default();
+        let file_path = input["file_path"].as_str().unwrap_or_default();
+        let content = input["content"].as_str().unwrap_or_default();
 
         if file_path.is_empty() {
             return Ok(ToolResult::error("file_path is required".into()));
@@ -68,7 +64,7 @@ impl Tool for WriteTool {
     }
 }
 
-fn resolve_path(file_path: &str, workspace_dir: &PathBuf) -> PathBuf {
+fn resolve_path(file_path: &str, workspace_dir: &Path) -> PathBuf {
     let path = PathBuf::from(file_path);
     if path.is_absolute() {
         path

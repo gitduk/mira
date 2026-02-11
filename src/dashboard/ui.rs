@@ -13,8 +13,14 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 pub fn render(frame: &mut Frame, state: &DashboardState, spinner_frame: usize) {
     let size = frame.area();
 
-    // Main layout: Header + Agent Panel + (optional) Input
-    let input_height = if state.input_mode { 3 } else { 0 };
+    // Main layout: Header + Agent Panel + Input (always visible when enabled)
+    // Input height grows with line count: border(2) + content lines, capped at 10.
+    let input_height = if state.input_enabled {
+        let line_count = state.input_buffer.split('\n').count().max(1);
+        (line_count as u16 + 2).min(10)
+    } else {
+        0
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -27,7 +33,7 @@ pub fn render(frame: &mut Frame, state: &DashboardState, spinner_frame: usize) {
     render_header(frame, chunks[0], state);
     render_agent_panel(frame, chunks[1], state, spinner_frame);
 
-    if state.input_mode {
+    if state.input_enabled {
         render_input(frame, chunks[2], state);
     }
 }
@@ -109,7 +115,14 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
         Span::raw(state.format_uptime()),
         Span::raw("  "),
     ]));
-    right_lines.push(Line::from(vec![Span::raw(" ")]));
+    right_lines.push(Line::from(vec![
+        Span::raw("Active Tasks: "),
+        Span::styled(
+            state.active_tasks.to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+    ]));
     right_lines.push(Line::from(vec![
         Span::raw("Active Agents: "),
         Span::styled(
@@ -151,11 +164,15 @@ fn render_agent_panel(frame: &mut Frame, area: Rect, state: &DashboardState, spi
         let mut wrapped: Vec<Line<'static>> = Vec::new();
 
         for line in &state.thinking_buffer {
-            wrapped.extend(wrap_markdown_line(line, content_width));
+            for segment in line.split('\n') {
+                wrapped.extend(wrap_markdown_line(segment, content_width));
+            }
         }
 
         if let Some(ref streaming) = state.streaming_line {
-            wrapped.extend(wrap_markdown_line(streaming, content_width));
+            for segment in streaming.split('\n') {
+                wrapped.extend(wrap_markdown_line(segment, content_width));
+            }
         }
 
         if let Some(ref spinner_text) = state.spinner_text {
@@ -321,8 +338,48 @@ fn wrap_spans(spans: Vec<(String, Style)>, width: usize) -> Vec<Line<'static>> {
 
 fn render_input(frame: &mut Frame, area: Rect, state: &DashboardState) {
     let block = Block::default().borders(Borders::ALL).title(" Input ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    let text = format!("> {}█", &state.input_buffer);
-    let paragraph = Paragraph::new(text).block(block);
-    frame.render_widget(paragraph, area);
+    // Split buffer into lines, figure out which line the cursor is on
+    let chars: Vec<char> = state.input_buffer.chars().collect();
+    let before_cursor: String = chars[..state.cursor_pos].iter().collect();
+    let cursor_line_idx = before_cursor.matches('\n').count();
+
+    let raw_lines: Vec<&str> = state.input_buffer.split('\n').collect();
+    let mut lines: Vec<Line<'_>> = Vec::new();
+
+    // Track char offset consumed so far to locate cursor within its line
+    let mut char_offset = 0;
+    for (i, raw) in raw_lines.iter().enumerate() {
+        let prefix = if i == 0 { "> " } else { "  " };
+        let line_char_count = raw.chars().count();
+
+        if i == cursor_line_idx {
+            let cursor_in_line = state.cursor_pos - char_offset;
+            let line_chars: Vec<char> = raw.chars().collect();
+            let before: String = line_chars[..cursor_in_line].iter().collect();
+            let after: String = line_chars[cursor_in_line..].iter().collect();
+            lines.push(Line::from(vec![
+                Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+                Span::raw(before),
+                Span::styled("█", Style::default().fg(Color::Gray)),
+                Span::raw(after),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+                Span::raw(raw.to_string()),
+            ]));
+        }
+
+        // +1 for the '\n' separator (except last line)
+        char_offset += line_char_count;
+        if i < raw_lines.len() - 1 {
+            char_offset += 1;
+        }
+    }
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, inner);
 }

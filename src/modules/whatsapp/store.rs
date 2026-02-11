@@ -30,6 +30,15 @@ impl WhatsAppStore {
 
     fn init_schema(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+
+        // Migration: rename group_folder -> workspace in sessions table (before CREATE TABLE)
+        let has_old_column: bool = conn
+            .prepare("SELECT group_folder FROM sessions LIMIT 0")
+            .is_ok();
+        if has_old_column {
+            conn.execute_batch("ALTER TABLE sessions RENAME COLUMN group_folder TO workspace;")?;
+        }
+
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS chats (
@@ -54,7 +63,7 @@ impl WhatsAppStore {
                 value TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS sessions (
-                group_folder TEXT PRIMARY KEY,
+                workspace TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL
             );
 
@@ -68,6 +77,7 @@ impl WhatsAppStore {
             );
             ",
         )?;
+
         Ok(())
     }
 
@@ -118,6 +128,7 @@ impl WhatsAppStore {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn store_message(
         &self,
         msg_id: &str,
@@ -199,22 +210,20 @@ impl WhatsAppStore {
         Ok(())
     }
 
-    pub fn get_session(&self, group_folder: &str) -> Result<Option<String>> {
+    pub fn get_session(&self, workspace: &str) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT session_id FROM sessions WHERE group_folder = ?1")?;
+        let mut stmt = conn.prepare("SELECT session_id FROM sessions WHERE workspace = ?1")?;
         let result = stmt
-            .query_row(rusqlite::params![group_folder], |row| {
-                row.get::<_, String>(0)
-            })
+            .query_row(rusqlite::params![workspace], |row| row.get::<_, String>(0))
             .ok();
         Ok(result)
     }
 
-    pub fn set_session(&self, group_folder: &str, session_id: &str) -> Result<()> {
+    pub fn set_session(&self, workspace: &str, session_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO sessions (group_folder, session_id) VALUES (?1, ?2)",
-            rusqlite::params![group_folder, session_id],
+            "INSERT OR REPLACE INTO sessions (workspace, session_id) VALUES (?1, ?2)",
+            rusqlite::params![workspace, session_id],
         )?;
         Ok(())
     }

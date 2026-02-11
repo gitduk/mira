@@ -10,7 +10,7 @@ pub struct Config {
     pub store_dir: PathBuf,
     pub groups_dir: PathBuf,
     pub data_dir: PathBuf,
-    pub main_group_folder: String,
+    pub main_workspace: String,
     pub max_concurrent_agents: usize,
     pub trigger_pattern: Regex,
     pub timezone: String,
@@ -38,7 +38,11 @@ impl Config {
         let trigger_pattern =
             Regex::new(&format!("(?i)^@{}\\b", escaped_name)).expect("Invalid trigger pattern");
 
-        let timezone = std::env::var("TZ").unwrap_or_else(|_| "UTC".into());
+        let timezone = std::env::var("TZ")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(detect_system_timezone)
+            .unwrap_or_else(|| "UTC".into());
 
         let dashboard_enabled = std::io::stdout().is_terminal()
             && std::env::var("DASHBOARD")
@@ -67,7 +71,7 @@ impl Config {
             store_dir: project_root.join("store"),
             groups_dir: project_root.join("groups"),
             data_dir: project_root.join("data"),
-            main_group_folder: "main".into(),
+            main_workspace: "main".into(),
             max_concurrent_agents,
             trigger_pattern,
             timezone,
@@ -80,7 +84,28 @@ impl Config {
         }
     }
 
-    pub fn is_main_group(&self, folder: &str) -> bool {
-        folder == self.main_group_folder
+    pub fn is_main_workspace(&self, workspace: &str) -> bool {
+        workspace == self.main_workspace
     }
+}
+
+/// Detect system timezone from /etc/localtime symlink or timedatectl.
+fn detect_system_timezone() -> Option<String> {
+    // Try reading /etc/localtime symlink (e.g. -> /usr/share/zoneinfo/Asia/Shanghai)
+    if let Ok(target) = std::fs::read_link("/etc/localtime") {
+        let path = target.to_string_lossy();
+        if let Some(pos) = path.find("/zoneinfo/") {
+            return Some(path[pos + "/zoneinfo/".len()..].to_string());
+        }
+    }
+
+    // Try /etc/timezone (Debian/Ubuntu)
+    if let Ok(tz) = std::fs::read_to_string("/etc/timezone") {
+        let tz = tz.trim().to_string();
+        if !tz.is_empty() {
+            return Some(tz);
+        }
+    }
+
+    None
 }

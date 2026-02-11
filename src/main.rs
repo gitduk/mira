@@ -437,6 +437,19 @@ async fn main() {
                             )))
                             .await;
 
+                        // Send "composing" presence to show typing indicator
+                        {
+                            let modules_lock = modules.lock().await;
+                            if let Some(module) = modules_lock.get(&module_id) {
+                                let _ = module
+                                    .send_command(ModuleCommand::SendPresence {
+                                        channel_id: item.addr.channel_id.clone(),
+                                        presence: "composing".into(),
+                                    })
+                                    .await;
+                            }
+                        }
+
                         let output = agent::run_agent(
                             agent_input,
                             &config,
@@ -445,6 +458,19 @@ async fn main() {
                             on_progress,
                         )
                         .await;
+
+                        // Clear typing indicator
+                        {
+                            let modules_lock = modules.lock().await;
+                            if let Some(module) = modules_lock.get(&module_id) {
+                                let _ = module
+                                    .send_command(ModuleCommand::SendPresence {
+                                        channel_id: item.addr.channel_id.clone(),
+                                        presence: "paused".into(),
+                                    })
+                                    .await;
+                            }
+                        }
 
                         let _ = dash_tx
                             .send(DashboardCommand::SetThinkingIndicator(None))
@@ -471,6 +497,20 @@ async fn main() {
                                 .await;
                             return false;
                         }
+
+                        // Send agent's text reply back to the originating channel
+                        if let Some(ref resp) = output.result {
+                            if let Some(ref text) = resp.user_message {
+                                if !text.trim().is_empty() {
+                                    let _ = ipc_tx
+                                        .send(IpcCommand::SendMessage {
+                                            addr: item.addr.clone(),
+                                            text: text.clone(),
+                                        })
+                                        .await;
+                                }
+                            }
+                        }
                     }
 
                     true
@@ -496,6 +536,15 @@ async fn main() {
                 match event {
                     ModuleEvent::Message(msg) => {
                         if !msg.is_from_self {
+                            let display = format!(
+                                "[{}] {}: {}",
+                                msg.addr.module_id,
+                                msg.sender_name,
+                                msg.content,
+                            );
+                            let _ = dash_tx
+                                .send(DashboardCommand::PushThinkingLine(display))
+                                .await;
                             let _ = dash_tx
                                 .send(DashboardCommand::IncrementMessages(1))
                                 .await;

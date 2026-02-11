@@ -249,6 +249,67 @@ impl WhatsAppStore {
         Ok(groups)
     }
 
+    /// Get private chat JIDs (ending in @s.whatsapp.net) that have messages,
+    /// excluding any JIDs already in registered_groups.
+    /// Returns Vec<(chat_jid, last_agent_ts)>.
+    pub fn get_active_private_chats(&self, module_id: &str) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT m.chat_jid
+             FROM messages m
+             LEFT JOIN registered_groups rg ON m.chat_jid = rg.jid
+             WHERE m.chat_jid NOT LIKE '%@g.us'
+               AND m.chat_jid NOT LIKE '%@broadcast'
+               AND rg.jid IS NULL",
+        )?;
+
+        let jids: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut result = Vec::new();
+        for jid in jids {
+            let key = format!("last_agent_ts:{}:{}", module_id, jid);
+            let last_ts = self.get_router_state_inner(&conn, &key).unwrap_or_default();
+
+            // Check if there are messages newer than last_agent_ts
+            let has_new: bool = conn
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM messages
+                        WHERE chat_jid = ?1 AND timestamp > ?2 AND is_from_me = 0
+                    )",
+                    rusqlite::params![jid, last_ts],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+
+            if has_new {
+                result.push((jid, last_ts));
+            }
+        }
+
+        Ok(result)
+    }
+
+    pub fn get_chat_name(&self, chat_jid: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT name FROM chats WHERE jid = ?1")?;
+        let result = stmt
+            .query_row(rusqlite::params![chat_jid], |row| row.get::<_, String>(0))
+            .ok();
+        Ok(result)
+    }
+
+    fn get_router_state_inner(&self, conn: &Connection, key: &str) -> Option<String> {
+        let mut stmt = conn
+            .prepare("SELECT value FROM router_state WHERE key = ?1")
+            .ok()?;
+        stmt.query_row(rusqlite::params![key], |row| row.get::<_, String>(0))
+            .ok()
+    }
+
     pub fn set_registered_group(&self, jid: &str, group: &RegisteredGroup) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let requires_trigger = match group.requires_trigger {

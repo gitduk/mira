@@ -42,6 +42,9 @@ const logger = {
 
 let sock: WASocket;
 let lidToPhoneMap: Record<string, string> = {};
+let selfJids: Set<string> = new Set();
+// Track message IDs we sent ourselves, so we can mark them as is_from_me
+let sentMsgIds: Set<string> = new Set();
 
 async function translateJid(jid: string): Promise<string> {
   if (!jid.endsWith("@lid")) return jid;
@@ -107,12 +110,18 @@ async function connect(): Promise<void> {
     } else if (connection === "open") {
       emit({ type: "connection", status: "open" });
 
-      // Build LID mapping
+      // Build self JID set and LID mapping
       if (sock.user) {
         const phoneUser = sock.user.id.split(":")[0];
         const lidUser = sock.user.lid?.split(":")[0];
-        if (lidUser && phoneUser) {
-          lidToPhoneMap[lidUser] = `${phoneUser}@s.whatsapp.net`;
+        if (phoneUser) {
+          selfJids.add(`${phoneUser}@s.whatsapp.net`);
+        }
+        if (lidUser) {
+          selfJids.add(`${lidUser}@lid`);
+          if (phoneUser) {
+            lidToPhoneMap[lidUser] = `${phoneUser}@s.whatsapp.net`;
+          }
         }
       }
 
@@ -144,7 +153,39 @@ async function connect(): Promise<void> {
           msg.message?.videoMessage?.caption ||
           "";
 
-        const sender = msg.key.participant || msg.key.remoteJid || "";
+        // Determine the actual sender JID.
+        // Group chats: participant is the sender.
+        // Private chats: participant is absent. remoteJid is always the OTHER
+        // party, regardless of direction. Use selfJids to determine if we sent it.
+        let sender: string;
+        let isFromMe: boolean;
+        if (msg.key.participant) {
+          // Group chat
+          sender = msg.key.participant;
+          const senderUser = sender.split(":")[0];
+          isFromMe = selfJids.has(senderUser);
+        } else {
+          // Private chat: remoteJid is the other person.
+          // If selfJids contains remoteJid, it's a "note to self" chat.
+          const remoteUser = (rawJid || "").split(":")[0];
+          if (selfJids.has(remoteUser)) {
+            sender = rawJid || "";
+            isFromMe = true;
+          } else {
+            // Private chat with another person.
+            // msg.key.fromMe is unreliable on linked devices with LID JIDs —
+            // it can be true even for incoming messages. Instead, check if we
+            // sent this message ourselves by looking up the msg_id.
+            sender = rawJid || "";
+            const msgId = msg.key.id || "";
+            if (msgId && sentMsgIds.has(msgId)) {
+              isFromMe = true;
+              sentMsgIds.delete(msgId);
+            } else {
+              isFromMe = false;
+            }
+          }
+        }
         const senderName = msg.pushName || sender.split("@")[0];
 
         emit({
@@ -155,7 +196,7 @@ async function connect(): Promise<void> {
           sender_name: senderName,
           content,
           timestamp,
-          is_from_me: msg.key.fromMe || false,
+          is_from_me: isFromMe,
         });
 
         // Also emit chat metadata
@@ -180,11 +221,20 @@ rl.on("line", async (line: string) => {
       case "send_message":
         if (sock && cmd.jid && cmd.text) {
           const result = await sock.sendMessage(cmd.jid, { text: cmd.text });
+          const sentId = result?.key?.id || "";
+          if (sentId) {
+            sentMsgIds.add(sentId);
+          }
           emit({
             type: "message_sent",
-            msg_id: result?.key?.id || "",
+            msg_id: sentId,
             jid: cmd.jid,
           });
+        }
+        break;
+      case "send_presence":
+        if (sock && cmd.jid && cmd.presence) {
+          await sock.sendPresenceUpdate(cmd.presence, cmd.jid);
         }
         break;
       case "fetch_groups":

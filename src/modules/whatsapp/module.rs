@@ -200,6 +200,17 @@ impl CommunicationModule for WhatsAppModule {
                     })
                     .await?;
             }
+            ModuleCommand::SendPresence {
+                channel_id,
+                presence,
+            } => {
+                sender
+                    .send(BridgeCommand::SendPresence {
+                        jid: channel_id,
+                        presence,
+                    })
+                    .await?;
+            }
             ModuleCommand::Shutdown => {
                 let _ = sender.send(BridgeCommand::Shutdown).await;
             }
@@ -334,13 +345,11 @@ impl CommunicationModule for WhatsAppModule {
     }
 
     async fn drain_work_items(&self) -> Result<Vec<ModuleWorkItem>> {
-        let groups = self.store.get_registered_groups().unwrap_or_default();
-        if groups.is_empty() {
-            return Ok(Vec::new());
-        }
-
         let mut work_items = Vec::new();
-        for (jid, group) in groups {
+
+        // 1. Process registered groups
+        let groups = self.store.get_registered_groups().unwrap_or_default();
+        for (jid, group) in &groups {
             let key = format!("last_agent_ts:{}:{}", MODULE_ID, jid);
             let last_agent_ts = self
                 .store
@@ -350,7 +359,7 @@ impl CommunicationModule for WhatsAppModule {
                 .unwrap_or_default();
 
             let messages = match self.store.get_messages_since(
-                &jid,
+                jid,
                 &last_agent_ts,
                 &self.config.assistant_name,
             ) {
@@ -374,7 +383,7 @@ impl CommunicationModule for WhatsAppModule {
                 prompt.push_str(&format!(
                     "<message sender=\"{}\" channel=\"{}\" time=\"{}\">{}</message>\n",
                     xml_escape(&msg.sender_name),
-                    xml_escape(&jid),
+                    xml_escape(jid),
                     msg.timestamp,
                     xml_escape(&msg.content),
                 ));
@@ -388,8 +397,61 @@ impl CommunicationModule for WhatsAppModule {
             work_items.push(ModuleWorkItem {
                 prompt,
                 group_folder,
-                addr: ChannelAddr::new(MODULE_ID, &jid),
+                addr: ChannelAddr::new(MODULE_ID, jid),
                 is_main,
+                is_scheduled_task: false,
+                workspace_dir,
+                global_claude_md: None,
+            });
+        }
+
+        // 2. Process private chats (without registration)
+        let private_chats = self
+            .store
+            .get_active_private_chats(MODULE_ID)
+            .unwrap_or_default();
+        for (jid, last_agent_ts) in private_chats {
+            let messages = match self.store.get_messages_since(
+                &jid,
+                &last_agent_ts,
+                &self.config.assistant_name,
+            ) {
+                Ok(msgs) => msgs,
+                Err(e) => {
+                    warn!(jid, "Failed to fetch private chat messages: {}", e);
+                    continue;
+                }
+            };
+
+            if messages.is_empty() {
+                continue;
+            }
+
+            let key = format!("last_agent_ts:{}:{}", MODULE_ID, jid);
+            if let Some(last_msg) = messages.last() {
+                let _ = self.store.set_router_state(&key, &last_msg.timestamp);
+            }
+
+            let mut prompt = String::from("<messages>\n");
+            for msg in &messages {
+                prompt.push_str(&format!(
+                    "<message sender=\"{}\" channel=\"{}\" time=\"{}\">{}</message>\n",
+                    xml_escape(&msg.sender_name),
+                    xml_escape(&jid),
+                    msg.timestamp,
+                    xml_escape(&msg.content),
+                ));
+            }
+            prompt.push_str("</messages>");
+
+            let group_folder = "dm".to_string();
+            let workspace_dir = self.config.groups_dir.join(&group_folder);
+
+            work_items.push(ModuleWorkItem {
+                prompt,
+                group_folder,
+                addr: ChannelAddr::new(MODULE_ID, &jid),
+                is_main: false,
                 is_scheduled_task: false,
                 workspace_dir,
                 global_claude_md: None,

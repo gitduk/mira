@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BridgeCommand {
     SendMessage { jid: String, text: String },
+    SendPresence { jid: String, presence: String },
     FetchGroups,
     Shutdown,
 }

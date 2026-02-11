@@ -5,7 +5,7 @@
     "": {
       "name": "nanoclaw-bridge",
       "dependencies": {
-        "@whiskeysockets/baileys": "^6.7.16",
+        "@whiskeysockets/baileys": "^6.7.21",
         "qrcode-terminal": "^0.12.0",
         "tsx": "^4.19.0",
       },

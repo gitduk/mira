@@ -68,7 +68,14 @@ pub enum ModuleEvent {
 /// Commands sent from Mira core to a module.
 #[derive(Debug)]
 pub enum ModuleCommand {
-    SendMessage { channel_id: String, text: String },
+    SendMessage {
+        channel_id: String,
+        text: String,
+    },
+    SendPresence {
+        channel_id: String,
+        presence: String,
+    },
     Shutdown,
 }
 
